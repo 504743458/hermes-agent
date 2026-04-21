@@ -57,12 +57,8 @@ class TestBrowserBackedWebFallback:
             patch("tools.web_tools._get_firecrawl_client", side_effect=AssertionError("firecrawl should not run")),
             patch("tools.browser_tool.check_browser_requirements", return_value=True),
             patch(
-                "tools.web_tools._run_agent_browser_json",
-                side_effect=[
-                    {"success": True, "data": {"url": "https://duckduckgo.com/html/?q=hermes+agent"}},
-                    {"success": True, "data": browser_results},
-                    {"success": True, "data": {"closed": True}},
-                ],
+                "tools.web_tools._query_browser_search_engine",
+                return_value={"success": True, "data": {"web": browser_results["result"]}},
             ),
             patch("tools.interrupt.is_interrupted", return_value=False),
         ):
