@@ -8,6 +8,14 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 
 
 class TestBrowserSearchQualityHelpers:
+    def test_engine_specs_expose_primary_and_fallback_engines(self):
+        from tools.web_tools import _get_browser_search_engine_specs
+
+        specs = _get_browser_search_engine_specs()
+
+        assert [spec["name"] for spec in specs] == ["bing", "duckduckgo_html", "duckduckgo_lite"]
+        assert all("url_template" in spec for spec in specs)
+
     def test_bing_script_targets_result_blocks(self):
         from tools.web_tools import _browser_search_eval_script
 
@@ -250,6 +258,57 @@ class TestBrowserSearchQualityHelpers:
 
         assert _browser_search_results_are_weak(results, 3, query="Python asyncio tutorial") is True
 
+    def test_merge_can_preserve_source_lineage(self):
+        from tools.web_tools import _merge_browser_search_results
+
+        primary = [
+            {
+                "title": "GitHub - NousResearch/hermes-agent",
+                "url": "https://github.com/nousresearch/hermes-agent",
+                "description": "",
+                "position": 1,
+                "_source": "dom",
+            }
+        ]
+        snapshot = [
+            {
+                "title": "GitHub - NousResearch/hermes-agent: The agent that grows with you · GitHub",
+                "url": "https://github.com/nousresearch/hermes-agent",
+                "description": "The self-improving AI agent built by Nous Research.",
+                "position": 1,
+                "_source": "snapshot",
+            }
+        ]
+
+        merged = _merge_browser_search_results(primary, snapshot, limit=5)
+
+        assert merged[0]["_source"] == "merged"
+
+    def test_normalized_candidates_preserve_source_metadata(self):
+        from tools.web_tools import _normalize_browser_search_candidates
+
+        candidates = [
+            {
+                "title": "Example Domain",
+                "url": "https://example.com/",
+                "description": "This domain is for use in documentation examples.",
+                "_source": "dom",
+                "_engine": "bing",
+                "_query_variant": "Example Domain",
+            }
+        ]
+
+        results = _normalize_browser_search_candidates(
+            candidates,
+            engine="bing",
+            limit=5,
+            query="Example Domain",
+        )
+
+        assert results[0]["_source"] == "dom"
+        assert results[0]["_engine"] == "bing"
+        assert results[0]["_query_variant"] == "Example Domain"
+
 
 class TestBrowserSearchQueryVariants:
     def test_github_query_adds_repo_focused_retry(self):
@@ -363,7 +422,7 @@ class TestBrowserSearchEngineSelection:
             patch("tools.browser_tool.check_browser_requirements", return_value=True),
             patch(
                 "tools.web_tools._query_browser_search_engine",
-                side_effect=[weak, strong],
+                side_effect=[weak, weak, strong],
             ) as query_engine,
             patch("tools.interrupt.is_interrupted", return_value=False),
         ):
@@ -374,8 +433,10 @@ class TestBrowserSearchEngineSelection:
         assert result["data"]["web"][0]["url"] == "https://docs.python.org/3/library/asyncio.html"
         first_query = query_engine.call_args_list[0].args[1]
         second_query = query_engine.call_args_list[1].args[1]
+        third_query = query_engine.call_args_list[2].args[1]
         assert first_query == "Python asyncio tutorial"
-        assert second_query != first_query
+        assert second_query == first_query
+        assert third_query != first_query
 
     def test_browser_search_stops_when_time_budget_is_exhausted(self):
         with (
@@ -383,7 +444,7 @@ class TestBrowserSearchEngineSelection:
             patch("tools.web_tools._get_firecrawl_client", side_effect=AssertionError("firecrawl should not run")),
             patch("tools.browser_tool.check_browser_requirements", return_value=True),
             patch("tools.web_tools._query_browser_search_engine", return_value={"success": True, "data": {"web": []}}) as query_engine,
-            patch("tools.web_tools.time.monotonic", side_effect=[0.0, 0.0, 20.0, 20.0, 20.0]),
+            patch("tools.web_tools.time.monotonic", side_effect=[0.0, 0.0, 20.0, 20.0, 20.0, 20.0, 20.0]),
             patch("tools.interrupt.is_interrupted", return_value=False),
         ):
             from tools.web_tools import web_search_tool
@@ -392,3 +453,70 @@ class TestBrowserSearchEngineSelection:
 
         assert result["data"]["web"] == []
         assert query_engine.call_count == 1
+
+    def test_browser_search_retries_primary_query_once_on_transient_failure(self):
+        strong = {
+            "success": True,
+            "data": {
+                "web": [
+                    {
+                        "title": "GitHub - NousResearch/hermes-agent: The agent that grows with you · GitHub",
+                        "url": "https://github.com/nousresearch/hermes-agent",
+                        "description": "Official repository",
+                        "position": 1,
+                    }
+                ]
+            },
+        }
+
+        with (
+            patch("tools.web_tools._load_web_config", return_value={"backend": "firecrawl"}),
+            patch("tools.web_tools._get_firecrawl_client", side_effect=AssertionError("firecrawl should not run")),
+            patch("tools.browser_tool.check_browser_requirements", return_value=True),
+            patch(
+                "tools.web_tools._query_browser_search_engine",
+                side_effect=[RuntimeError("transient browser failure"), strong],
+            ) as query_engine,
+            patch("tools.interrupt.is_interrupted", return_value=False),
+        ):
+            from tools.web_tools import web_search_tool
+
+            result = json.loads(web_search_tool("Hermes Agent GitHub", limit=5))
+
+        assert result["data"]["web"][0]["url"] == "https://github.com/nousresearch/hermes-agent"
+        assert query_engine.call_args_list[0].args[1] == "Hermes Agent GitHub"
+        assert query_engine.call_args_list[1].args[1] == "Hermes Agent GitHub"
+
+    def test_browser_search_retries_primary_query_once_on_empty_results(self):
+        empty = {"success": True, "data": {"web": []}}
+        strong = {
+            "success": True,
+            "data": {
+                "web": [
+                    {
+                        "title": "GitHub - NousResearch/hermes-agent: The agent that grows with you · GitHub",
+                        "url": "https://github.com/nousresearch/hermes-agent",
+                        "description": "Official repository",
+                        "position": 1,
+                    }
+                ]
+            },
+        }
+
+        with (
+            patch("tools.web_tools._load_web_config", return_value={"backend": "firecrawl"}),
+            patch("tools.web_tools._get_firecrawl_client", side_effect=AssertionError("firecrawl should not run")),
+            patch("tools.browser_tool.check_browser_requirements", return_value=True),
+            patch(
+                "tools.web_tools._query_browser_search_engine",
+                side_effect=[empty, strong],
+            ) as query_engine,
+            patch("tools.interrupt.is_interrupted", return_value=False),
+        ):
+            from tools.web_tools import web_search_tool
+
+            result = json.loads(web_search_tool("Hermes Agent GitHub", limit=5))
+
+        assert result["data"]["web"][0]["url"] == "https://github.com/nousresearch/hermes-agent"
+        assert query_engine.call_args_list[0].args[1] == "Hermes Agent GitHub"
+        assert query_engine.call_args_list[1].args[1] == "Hermes Agent GitHub"
