@@ -45,6 +45,9 @@ import logging
 import os
 import re
 import asyncio
+import base64
+import subprocess
+import threading
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx
 # NOTE: `from firecrawl import Firecrawl` is deliberately NOT at module top —
@@ -102,6 +105,7 @@ from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
+_BROWSER_FALLBACK_LOCK = threading.Lock()
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -197,6 +201,315 @@ def _is_backend_available(backend: str) -> bool:
     if backend == "searxng":
         return _has_env("SEARXNG_URL")
     return False
+
+
+def _browser_fallback_available() -> bool:
+    """Return True when the local/browser automation path can back web tools."""
+    try:
+        from tools.browser_tool import check_browser_requirements
+    except Exception:
+        return False
+
+    try:
+        return check_browser_requirements()
+    except Exception:
+        return False
+
+
+def _parse_browser_result(raw: str, context: str) -> Dict[str, Any]:
+    """Parse browser tool JSON and raise a helpful error on failure."""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Browser fallback returned invalid JSON for {context}: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Browser fallback returned an invalid payload for {context}")
+
+    return parsed
+
+
+def _browser_result_data(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the nested data payload when present."""
+    data = payload.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _find_agent_browser_cli() -> List[str]:
+    """Find the agent-browser executable as argv prefix."""
+    try:
+        from tools.browser_tool import _find_agent_browser
+        browser_cmd = _find_agent_browser()
+    except Exception:
+        browser_cmd = ""
+
+    if browser_cmd == "npx agent-browser":
+        return ["npx", "agent-browser"]
+    if browser_cmd:
+        return [browser_cmd]
+
+    import shutil
+    direct = shutil.which("agent-browser")
+    if direct:
+        return [direct]
+
+    npx = shutil.which("npx")
+    if npx:
+        return ["npx", "agent-browser"]
+
+    raise FileNotFoundError("agent-browser CLI not found")
+
+
+def _run_agent_browser_json(command: str, args: Optional[List[str]] = None, timeout: int = 30) -> Dict[str, Any]:
+    """Run agent-browser directly in JSON mode and return the parsed payload."""
+    cmd = _find_agent_browser_cli() + ["--json", command] + (args or [])
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        stdin=subprocess.DEVNULL,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        detail = stderr or stdout or f"exit code {proc.returncode}"
+        raise ValueError(f"agent-browser {command} failed: {detail}")
+    if not stdout:
+        raise ValueError(f"agent-browser {command} returned no output")
+
+    return _parse_browser_result(stdout, f"agent-browser {command}")
+
+
+def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
+    """Run a no-key web search via the browser tool path."""
+    from urllib.parse import quote_plus
+
+    search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    with _BROWSER_FALLBACK_LOCK:
+        nav = _run_agent_browser_json("open", [search_url])
+        if not nav.get("success"):
+            raise ValueError(nav.get("error") or "Browser search navigation failed")
+
+        expression = f"""(() => {{
+          const limit = {max(1, min(limit, 10))};
+          const cleanText = (value) => (value || "")
+            .replace(/\\r/g, "")
+            .replace(/[ \\t]+/g, " ")
+            .replace(/\\n{{3,}}/g, "\\n\\n")
+            .trim();
+          const normalizeUrl = (href) => {{
+            try {{
+              const resolved = new URL(href, window.location.href);
+              const redirected = resolved.searchParams.get("uddg");
+              if (redirected) return decodeURIComponent(redirected);
+              return resolved.href;
+            }} catch (_err) {{
+              return href || "";
+            }}
+          }};
+
+          const selectors = [
+            ".result",
+            ".results_links",
+            ".result__body",
+            "article",
+            "[data-testid='result']",
+          ];
+          const containers = [];
+          for (const selector of selectors) {{
+            for (const node of document.querySelectorAll(selector)) {{
+              if (!containers.includes(node)) containers.push(node);
+            }}
+          }}
+          if (!containers.length) containers.push(document.body);
+
+          const results = [];
+          const seen = new Set();
+          for (const container of containers) {{
+            const link = container.querySelector("a.result__a, h2 a, a[href]");
+            if (!link) continue;
+
+            const url = normalizeUrl(link.getAttribute("href") || "");
+            const lowerUrl = url.toLowerCase();
+            if (!(lowerUrl.startsWith("http://") || lowerUrl.startsWith("https://"))) continue;
+            if (lowerUrl.includes("duckduckgo.com/") && !lowerUrl.includes("/l/")) continue;
+            if (seen.has(url)) continue;
+
+            const title = cleanText(link.innerText || link.textContent || "");
+            if (!title) continue;
+
+            const snippetNode = container.querySelector(".result__snippet, .snippet, .result-snippet, p");
+            let description = cleanText(snippetNode ? (snippetNode.innerText || snippetNode.textContent || "") : "");
+            if (!description) {{
+              description = cleanText((container.innerText || container.textContent || "").replace(title, ""));
+            }}
+
+            seen.add(url);
+            results.push({{
+              title,
+              url,
+              description,
+              position: results.length + 1,
+            }});
+
+            if (results.length >= limit) break;
+          }}
+
+          return results;
+        }})()"""
+        encoded = base64.b64encode(expression.encode("utf-8")).decode("ascii")
+        try:
+            evaluated = _run_agent_browser_json("eval", ["-b", encoded])
+        finally:
+            try:
+                _run_agent_browser_json("close", [], timeout=15)
+            except Exception:
+                logger.debug("agent-browser close failed after search fallback", exc_info=True)
+
+        if not evaluated.get("success"):
+            raise ValueError(evaluated.get("error") or "Browser search extraction failed")
+
+    raw_results = _browser_result_data(evaluated).get("result")
+    if not isinstance(raw_results, list):
+        raise ValueError("Browser search extraction returned an invalid result list")
+
+    results = []
+    for idx, item in enumerate(raw_results[:limit], start=1):
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "")).strip()
+        title = str(item.get("title", "")).strip()
+        description = str(item.get("description", "")).strip()
+        if not url or not title:
+            continue
+        results.append({
+            "title": title,
+            "url": url,
+            "description": description,
+            "position": idx,
+        })
+
+    return {
+        "success": True,
+        "data": {
+            "web": results,
+        },
+    }
+
+
+def _browser_extract_documents(urls: List[str], format: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Extract web page content through the browser tool path."""
+    results: List[Dict[str, Any]] = []
+
+    for index, url in enumerate(urls, start=1):
+        with _BROWSER_FALLBACK_LOCK:
+            try:
+                nav = _run_agent_browser_json("open", [url], timeout=60)
+            except Exception as exc:
+                results.append({
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": str(exc),
+                })
+                continue
+
+            if not nav.get("success"):
+                results.append({
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": nav.get("error") or "Browser navigation failed",
+                })
+                continue
+
+            expression = """(() => {
+              const cleanText = (value) => (value || "")
+                .replace(/\\r/g, "")
+                .replace(/[ \\t]+/g, " ")
+                .replace(/[ \\t]+\\n/g, "\\n")
+                .replace(/\\n{3,}/g, "\\n\\n")
+                .trim();
+              const selectors = [
+                "main article",
+                "article",
+                "main",
+                "[role='main']",
+                "#content",
+                ".content",
+                ".post",
+                ".article",
+                ".entry-content",
+              ];
+
+              let chosenText = "";
+              for (const selector of selectors) {
+                const node = document.querySelector(selector);
+                if (!node) continue;
+                const text = cleanText(node.innerText || node.textContent || "");
+                if (text.length > chosenText.length) chosenText = text;
+              }
+
+              const bodyText = cleanText(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+              if (bodyText.length > chosenText.length) chosenText = bodyText;
+
+              return {
+                url: window.location.href,
+                title: cleanText(document.title || ""),
+                content: chosenText,
+                html: document.documentElement ? document.documentElement.outerHTML : "",
+              };
+            })()"""
+            encoded = base64.b64encode(expression.encode("utf-8")).decode("ascii")
+            try:
+                evaluated = _run_agent_browser_json("eval", ["-b", encoded], timeout=60)
+            finally:
+                try:
+                    _run_agent_browser_json("close", [], timeout=15)
+                except Exception:
+                    logger.debug("agent-browser close failed after extract fallback", exc_info=True)
+
+            if not evaluated.get("success"):
+                results.append({
+                    "url": _browser_result_data(nav).get("url", url) or url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": evaluated.get("error") or "Browser extraction failed",
+                })
+                continue
+
+        extracted = _browser_result_data(evaluated).get("result")
+        if not isinstance(extracted, dict):
+            results.append({
+                "url": _browser_result_data(nav).get("url", url) or url,
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "error": "Browser extraction returned an invalid payload",
+            })
+            continue
+
+        final_url = str(extracted.get("url") or nav.get("url") or url).strip() or url
+        final_title = str(extracted.get("title", "")).strip()
+        content_text = str(extracted.get("content", "")).strip()
+        html_content = str(extracted.get("html", "")).strip()
+        chosen_content = html_content if format == "html" else content_text
+
+        results.append({
+            "url": final_url,
+            "title": final_title,
+            "content": chosen_content,
+            "raw_content": chosen_content,
+        })
+
+    return results
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
@@ -553,6 +866,9 @@ def _get_default_summarizer_model() -> Optional[str]:
     return model
 
 _debug = DebugSession("web_tools", env_var="WEB_TOOLS_DEBUG")
+if not _debug.active:
+    _debug.log_call = lambda *args, **kwargs: None
+    _debug.save = lambda *args, **kwargs: None
 
 
 async def process_content_with_llm(
@@ -1170,8 +1486,17 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        # Dispatch to the configured search backend
+        # Dispatch to the configured search backend.
         backend = _get_search_backend()
+        if not _is_backend_available(backend) and _browser_fallback_available():
+            response_data = _browser_search_tool(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         if backend == "parallel":
             response_data = _parallel_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
@@ -1320,6 +1645,7 @@ async def web_extract_tool(
     
     try:
         logger.info("Extracting content from %d URL(s)", len(urls))
+        used_browser_fallback = False
 
         # ── SSRF protection — filter out private/internal URLs before any backend ──
         safe_urls = []
@@ -1339,7 +1665,11 @@ async def web_extract_tool(
         else:
             backend = _get_extract_backend()
 
-            if backend == "parallel":
+            if not _is_backend_available(backend) and _browser_fallback_available():
+                results = _browser_extract_documents(safe_urls, format=format)
+                debug_call_data["processing_applied"].append("browser_fallback")
+                used_browser_fallback = True
+            elif backend == "parallel":
                 results = await _parallel_extract(safe_urls)
             elif backend == "exa":
                 results = _exa_extract(safe_urls)
@@ -1577,6 +1907,9 @@ async def web_extract_tool(
         
         debug_call_data["final_response_size"] = len(cleaned_result)
         debug_call_data["processing_applied"].append("base64_image_removal")
+
+        if used_browser_fallback:
+            return cleaned_result
         
         # Log debug information
         _debug.log_call("web_extract_tool", debug_call_data)
@@ -2033,11 +2366,16 @@ def check_firecrawl_api_key() -> bool:
 
 
 def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available."""
+    """Check whether the configured API-style web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
     if configured in ("exa", "parallel", "firecrawl", "tavily", "searxng"):
         return _is_backend_available(configured)
     return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng"))
+
+
+def check_web_tool_available() -> bool:
+    """Check whether web tools are available via API backend or browser fallback."""
+    return check_web_api_key() or _browser_fallback_available()
 
 
 def check_auxiliary_model() -> bool:
@@ -2056,7 +2394,7 @@ if __name__ == "__main__":
     print("=" * 40)
     
     # Check if API keys are available
-    web_available = check_web_api_key()
+    web_available = check_web_tool_available()
     tool_gateway_available = _is_tool_gateway_ready()
     firecrawl_key_available = bool(os.getenv("FIRECRAWL_API_KEY", "").strip())
     firecrawl_url_available = bool(os.getenv("FIRECRAWL_API_URL", "").strip())
@@ -2204,7 +2542,7 @@ registry.register(
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
-    check_fn=check_web_api_key,
+    check_fn=check_web_tool_available,
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
@@ -2215,7 +2553,7 @@ registry.register(
     schema=WEB_EXTRACT_SCHEMA,
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
-    check_fn=check_web_api_key,
+    check_fn=check_web_tool_available,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",
