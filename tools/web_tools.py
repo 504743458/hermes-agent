@@ -739,6 +739,13 @@ def _public_browser_search_results(results: List[Dict[str, Any]]) -> List[Dict[s
     return public
 
 
+def _remaining_browser_search_timeout(deadline: Optional[float], default_timeout: int) -> int:
+    if deadline is None:
+        return default_timeout
+    remaining = max(1, int(deadline - time.monotonic()))
+    return min(default_timeout, remaining)
+
+
 def _browser_search_results_are_weak(results: List[Dict[str, Any]], limit: int, query: str = "") -> bool:
     if not _search_results_meet_threshold(results, limit):
         return True
@@ -849,7 +856,12 @@ def _browser_search_eval_script(engine: str, limit: int) -> str:
     }})()"""
 
 
-def _query_browser_search_engine(engine: Dict[str, str], query: str, limit: int) -> Dict[str, Any]:
+def _query_browser_search_engine(
+    engine: Dict[str, str],
+    query: str,
+    limit: int,
+    deadline: Optional[float] = None,
+) -> Dict[str, Any]:
     """Query one browser-search engine and return the best normalized result set."""
     from urllib.parse import quote_plus
 
@@ -862,13 +874,23 @@ def _query_browser_search_engine(engine: Dict[str, str], query: str, limit: int)
 
     with _BROWSER_FALLBACK_LOCK:
         try:
-            nav = _run_agent_browser_session_json(session_name, "open", [search_url], timeout=20)
+            nav = _run_agent_browser_session_json(
+                session_name,
+                "open",
+                [search_url],
+                timeout=_remaining_browser_search_timeout(deadline, 20),
+            )
             if not nav.get("success"):
                 raise ValueError(nav.get("error") or "search navigation failed")
 
             script = _browser_search_eval_script(engine["name"], limit)
             encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
-            evaluated = _run_agent_browser_session_json(session_name, "eval", ["-b", encoded], timeout=15)
+            evaluated = _run_agent_browser_session_json(
+                session_name,
+                "eval",
+                ["-b", encoded],
+                timeout=_remaining_browser_search_timeout(deadline, 15),
+            )
             if evaluated.get("success"):
                 payload = _browser_result_data(evaluated).get("result")
                 if isinstance(payload, list):
@@ -891,7 +913,12 @@ def _query_browser_search_engine(engine: Dict[str, str], query: str, limit: int)
             )
 
             if engine["name"] == "bing" and raw_candidates and _browser_search_results_are_weak(results, limit, query=query):
-                snapshot_payload = _run_agent_browser_session_json(session_name, "snapshot", ["-c"], timeout=12)
+                snapshot_payload = _run_agent_browser_session_json(
+                    session_name,
+                    "snapshot",
+                    ["-c"],
+                    timeout=_remaining_browser_search_timeout(deadline, 12),
+                )
                 snapshot_text = _browser_result_data(snapshot_payload).get("snapshot", "")
                 snapshot_candidates = _extract_search_results_from_snapshot(
                     snapshot_text,
@@ -917,7 +944,12 @@ def _query_browser_search_engine(engine: Dict[str, str], query: str, limit: int)
             last_error = exc
         finally:
             try:
-                _run_agent_browser_session_json(session_name, "close", [], timeout=10)
+                _run_agent_browser_session_json(
+                    session_name,
+                    "close",
+                    [],
+                    timeout=_remaining_browser_search_timeout(deadline, 10),
+                )
             except Exception:
                 logger.debug("agent-browser close failed for search engine %s", engine["name"], exc_info=True)
 
@@ -929,6 +961,7 @@ def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
     best_response: Dict[str, Any] = {"success": True, "data": {"web": []}}
     best_score = 0
     started_at = time.monotonic()
+    deadline = started_at + _BROWSER_SEARCH_TIME_BUDGET_SECONDS
     query_variants = _build_browser_search_query_variants(query)[:2]
     engine_specs = _get_browser_search_engine_specs()
 
@@ -945,10 +978,10 @@ def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
         score = 0
         is_weak = True
         for attempt_index in range(attempts):
-            if time.monotonic() - started_at > _BROWSER_SEARCH_TIME_BUDGET_SECONDS:
+            if time.monotonic() >= deadline:
                 break
             try:
-                response = _query_browser_search_engine(primary_engine, variant, limit)
+                response = _query_browser_search_engine(primary_engine, variant, limit, deadline=deadline)
                 results = response.get("data", {}).get("web", [])
                 score = _browser_search_quality_score(results, variant)
                 is_weak = _browser_search_results_are_weak(results, limit, query=variant)
@@ -975,10 +1008,10 @@ def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
     fallback_variants = query_variants[:1]
     for engine in fallback_engines:
         for variant in fallback_variants:
-            if time.monotonic() - started_at > _BROWSER_SEARCH_TIME_BUDGET_SECONDS:
+            if time.monotonic() >= deadline:
                 break
             try:
-                response = _query_browser_search_engine(engine, variant, limit)
+                response = _query_browser_search_engine(engine, variant, limit, deadline=deadline)
             except Exception as exc:
                 logger.debug("browser search engine %s failed for variant %s: %s", engine["name"], variant, exc)
                 continue
@@ -994,7 +1027,7 @@ def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
                         "web": _public_browser_search_results(results),
                     },
                 }
-        if time.monotonic() - started_at > _BROWSER_SEARCH_TIME_BUDGET_SECONDS:
+        if time.monotonic() >= deadline:
             break
 
     return {
