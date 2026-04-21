@@ -147,6 +147,11 @@ def _get_browser_search_engine_specs() -> List[Dict[str, str]]:
     """Return the ordered browser-search engine specs."""
     return [dict(spec) for spec in _BROWSER_SEARCH_ENGINES]
 
+
+def _has_searxng_config() -> bool:
+    """Return True when a SearXNG base URL is configured."""
+    return bool(os.getenv("SEARXNG_BASE_URL", "").strip())
+
 def _load_web_config() -> dict:
     """Load the ``web:`` section from ~/.hermes/config.yaml."""
     try:
@@ -163,13 +168,14 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Firecrawl also counts as available when the managed
     # tool gateway is configured for Nous subscribers.
     backend_candidates = (
+        ("searxng", _has_searxng_config()),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
@@ -184,6 +190,8 @@ def _get_backend() -> str:
 
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
+    if backend == "searxng":
+        return _has_searxng_config()
     if backend == "exa":
         return _has_env("EXA_API_KEY")
     if backend == "parallel":
@@ -1210,6 +1218,8 @@ def _firecrawl_backend_help_suffix() -> str:
 def _web_requires_env() -> list[str]:
     """Return tool metadata env vars for the currently enabled web backends."""
     requires = [
+        "SEARXNG_BASE_URL",
+        "SEARXNG_API_KEY",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "TAVILY_API_KEY",
@@ -1226,6 +1236,50 @@ def _web_requires_env() -> list[str]:
             ]
         )
     return requires
+
+
+def _searxng_search(query: str, limit: int = 5) -> dict:
+    """Search using a self-hosted SearXNG instance and normalize the results."""
+    from tools.interrupt import is_interrupted
+
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    base_url = os.getenv("SEARXNG_BASE_URL", "").strip().rstrip("/")
+    api_key = os.getenv("SEARXNG_API_KEY", "").strip()
+    if not base_url:
+        return {"error": "SEARXNG_BASE_URL environment variable not set.", "success": False}
+
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = httpx.get(
+        f"{base_url}/search",
+        params={
+            "q": query,
+            "format": "json",
+            "pageno": 1,
+            "language": "en",
+        },
+        headers=headers,
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    results = []
+    for idx, item in enumerate(payload.get("results", [])[:limit], start=1):
+        results.append(
+            {
+                "title": item.get("title", "") or "",
+                "url": item.get("url", "") or "",
+                "description": item.get("content", "") or "",
+                "position": idx,
+            }
+        )
+
+    return {"success": True, "data": {"web": results}}
 
 
 def _get_firecrawl_client():
@@ -2120,6 +2174,14 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         # Dispatch to the configured backend
         backend = _get_backend()
+        if backend == "searxng":
+            response_data = _searxng_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
         if not _is_backend_available(backend) and _browser_fallback_available():
             response_data = _browser_search_tool(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
@@ -2287,6 +2349,22 @@ async def web_extract_tool(
                 results = _browser_extract_documents(safe_urls, format=format)
                 debug_call_data["processing_applied"].append("browser_fallback")
                 used_browser_fallback = True
+            elif backend == "searxng":
+                if _browser_fallback_available():
+                    results = _browser_extract_documents(safe_urls, format=format)
+                    debug_call_data["processing_applied"].append("browser_fallback")
+                    used_browser_fallback = True
+                else:
+                    results = [
+                        {
+                            "url": url,
+                            "title": "",
+                            "content": "",
+                            "raw_content": "",
+                            "error": "SearXNG supports search only. Configure a content-extraction backend or enable browser fallback.",
+                        }
+                        for url in safe_urls
+                    ]
             elif backend == "parallel":
                 results = await _parallel_extract(safe_urls)
             elif backend == "exa":
@@ -2971,9 +3049,9 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured API-style web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured in ("searxng", "exa", "parallel", "firecrawl", "tavily"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    return any(_is_backend_available(backend) for backend in ("searxng", "exa", "parallel", "firecrawl", "tavily"))
 
 
 def check_web_tool_available() -> bool:
