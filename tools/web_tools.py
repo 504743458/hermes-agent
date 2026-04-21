@@ -104,6 +104,11 @@ def _has_env(name: str) -> bool:
     val = os.getenv(name)
     return bool(val and val.strip())
 
+
+def _get_browser_search_engine_specs() -> List[Dict[str, str]]:
+    """Return the ordered browser-search engine specs."""
+    return [dict(spec) for spec in _BROWSER_SEARCH_ENGINES]
+
 def _load_web_config() -> dict:
     """Load the ``web:`` section from ~/.hermes/config.yaml."""
     try:
@@ -565,6 +570,9 @@ def _normalize_browser_search_candidates(
             "url": url,
             "description": description,
             "_score": score,
+            "_source": item.get("_source", "dom"),
+            "_engine": item.get("_engine", engine),
+            "_query_variant": item.get("_query_variant", query),
         }
         existing = best_by_url.get(url)
         if existing is None or candidate["_score"] > existing["_score"] or len(candidate["title"]) > len(existing["title"]):
@@ -580,6 +588,9 @@ def _normalize_browser_search_candidates(
                 "url": item["url"],
                 "description": item["description"],
                 "position": idx,
+                "_source": item.get("_source", "dom"),
+                "_engine": item.get("_engine", engine),
+                "_query_variant": item.get("_query_variant", query),
             }
         )
     return trimmed
@@ -630,6 +641,9 @@ def _extract_search_results_from_snapshot(
                 "url": url,
                 "description": description,
                 "position": len(results) + 1,
+                "_source": "snapshot",
+                "_engine": anchor.get("_engine", ""),
+                "_query_variant": anchor.get("_query_variant", ""),
             }
         )
         if len(results) >= limit:
@@ -686,6 +700,12 @@ def _merge_browser_search_results(
                 existing["description"] = item.get("description", "")
             if len(str(item.get("title", "")).strip()) > len(str(existing.get("title", "")).strip()):
                 existing["title"] = item.get("title", "")
+            if existing.get("_source") != item.get("_source"):
+                existing["_source"] = "merged"
+            if not existing.get("_engine") and item.get("_engine"):
+                existing["_engine"] = item.get("_engine")
+            if not existing.get("_query_variant") and item.get("_query_variant"):
+                existing["_query_variant"] = item.get("_query_variant")
 
     merge_in(primary)
     merge_in(secondary)
@@ -695,6 +715,20 @@ def _merge_browser_search_results(
     for idx, item in enumerate(items[:limit], start=1):
         item["position"] = idx
     return items[:limit]
+
+
+def _public_browser_search_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    public: List[Dict[str, Any]] = []
+    for item in results:
+        public.append(
+            {
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "description": item.get("description", ""),
+                "position": item.get("position"),
+            }
+        )
+    return public
 
 
 def _browser_search_results_are_weak(results: List[Dict[str, Any]], limit: int, query: str = "") -> bool:
@@ -830,7 +864,16 @@ def _query_browser_search_engine(engine: Dict[str, str], query: str, limit: int)
             if evaluated.get("success"):
                 payload = _browser_result_data(evaluated).get("result")
                 if isinstance(payload, list):
-                    raw_candidates = payload
+                    raw_candidates = [
+                        {
+                            **item,
+                            "_source": item.get("_source", "dom"),
+                            "_engine": engine["name"],
+                            "_query_variant": query,
+                        }
+                        for item in payload
+                        if isinstance(item, dict)
+                    ]
 
             results = _normalize_browser_search_candidates(
                 raw_candidates,
@@ -879,30 +922,45 @@ def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
     best_score = 0
     started_at = time.monotonic()
     query_variants = _build_browser_search_query_variants(query)[:2]
+    engine_specs = _get_browser_search_engine_specs()
 
-    primary_engine = _BROWSER_SEARCH_ENGINES[0]
-    fallback_engines = _BROWSER_SEARCH_ENGINES[1:]
+    primary_engine = engine_specs[0]
+    fallback_engines = tuple(engine_specs[1:])
     if _query_has_tutorial_intent(query) or _query_has_docs_intent(query):
         fallback_engines = ()
 
-    for variant in query_variants:
-        if time.monotonic() - started_at > _BROWSER_SEARCH_TIME_BUDGET_SECONDS:
-            break
-        try:
-            response = _query_browser_search_engine(primary_engine, variant, limit)
-        except Exception as exc:
-            logger.debug("browser search engine %s failed for variant %s: %s", primary_engine["name"], variant, exc)
+    for idx, variant in enumerate(query_variants):
+        attempts = 2 if idx == 0 else 1
+        response = None
+        last_exc: Optional[Exception] = None
+        results: List[Dict[str, Any]] = []
+        score = 0
+        is_weak = True
+        for attempt_index in range(attempts):
+            if time.monotonic() - started_at > _BROWSER_SEARCH_TIME_BUDGET_SECONDS:
+                break
+            try:
+                response = _query_browser_search_engine(primary_engine, variant, limit)
+                results = response.get("data", {}).get("web", [])
+                score = _browser_search_quality_score(results, variant)
+                is_weak = _browser_search_results_are_weak(results, limit, query=variant)
+                last_exc = None
+                if not is_weak or attempt_index == attempts - 1:
+                    break
+            except Exception as exc:
+                last_exc = exc
+        if response is None:
+            if last_exc is not None:
+                logger.debug("browser search engine %s failed for variant %s: %s", primary_engine["name"], variant, last_exc)
             continue
-        results = response.get("data", {}).get("web", [])
-        score = _browser_search_quality_score(results, variant)
         if score > best_score:
             best_response = response
             best_score = score
-        if _search_results_meet_threshold(results, limit) and not _browser_search_results_are_weak(results, limit, query=variant):
+        if _search_results_meet_threshold(results, limit) and not is_weak:
             return {
                 "success": True,
                 "data": {
-                    "web": results,
+                    "web": _public_browser_search_results(results),
                 },
             }
 
@@ -925,7 +983,7 @@ def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
                 return {
                     "success": True,
                     "data": {
-                        "web": results,
+                        "web": _public_browser_search_results(results),
                     },
                 }
         if time.monotonic() - started_at > _BROWSER_SEARCH_TIME_BUDGET_SECONDS:
@@ -934,7 +992,7 @@ def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
     return {
         "success": True,
         "data": {
-            "web": best_response.get("data", {}).get("web", []),
+            "web": _public_browser_search_results(best_response.get("data", {}).get("web", [])),
         },
     }
 
