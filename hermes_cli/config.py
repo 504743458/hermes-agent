@@ -1495,6 +1495,23 @@ OPTIONAL_ENV_VARS = {
     },
 
     # ── Tool API keys ──
+    "SEARXNG_BASE_URL": {
+        "description": "SearXNG base URL for self-hosted meta-search",
+        "prompt": "SearXNG base URL",
+        "url": None,
+        "tools": ["web_search"],
+        "password": False,
+        "category": "tool",
+    },
+    "SEARXNG_API_KEY": {
+        "description": "Optional SearXNG API key for protected instances",
+        "prompt": "SearXNG API key",
+        "url": None,
+        "tools": ["web_search"],
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
     "EXA_API_KEY": {
         "description": "Exa API key for AI-native web search and contents",
         "prompt": "Exa API key",
