@@ -100,6 +100,8 @@ For native Anthropic auth, Hermes prefers Claude Code's own credential files whe
 | Variable | Description |
 |----------|-------------|
 | `PARALLEL_API_KEY` | AI-native web search ([parallel.ai](https://parallel.ai/)) |
+| `SEARXNG_BASE_URL` | Base URL for a self-hosted SearXNG instance used for `web_search` |
+| `SEARXNG_API_KEY` | Optional API key for protected SearXNG instances |
 | `FIRECRAWL_API_KEY` | Web scraping and cloud browser ([firecrawl.dev](https://firecrawl.dev/)) |
 | `FIRECRAWL_API_URL` | Custom Firecrawl API endpoint for self-hosted instances (optional) |
 | `TAVILY_API_KEY` | Tavily API key for AI-native web search, extract, and crawl ([app.tavily.com](https://app.tavily.com/home)) |

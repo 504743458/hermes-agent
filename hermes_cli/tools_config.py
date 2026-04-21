@@ -236,6 +236,16 @@ TOOL_CATEGORIES = {
                 ],
             },
             {
+                "name": "SearXNG",
+                "badge": "free self-hosted",
+                "tag": "Meta-search backend for search requests; pair with browser fallback or another extract backend",
+                "web_backend": "searxng",
+                "env_vars": [
+                    {"key": "SEARXNG_BASE_URL", "prompt": "Your SearXNG base URL (e.g., http://localhost:8080)"},
+                    {"key": "SEARXNG_API_KEY", "prompt": "SearXNG API key (leave empty if not required)", "optional": True},
+                ],
+            },
+            {
                 "name": "Firecrawl Self-Hosted",
                 "badge": "free · self-hosted",
                 "tag": "Run your own Firecrawl instance (Docker)",
