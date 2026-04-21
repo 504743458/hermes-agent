@@ -454,6 +454,30 @@ class TestBrowserSearchEngineSelection:
         assert result["data"]["web"] == []
         assert query_engine.call_count == 1
 
+    def test_query_engine_caps_internal_timeouts_to_remaining_budget(self):
+        with (
+            patch("tools.web_tools._run_agent_browser_session_json") as run_session,
+            patch("tools.web_tools.time.monotonic", side_effect=[0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
+        ):
+            run_session.side_effect = [
+                {"success": True, "data": {"title": "Example", "url": "https://example.com"}},
+                {"success": True, "data": {"result": []}},
+                {"success": True, "data": {"closed": True}},
+            ]
+            from tools.web_tools import _query_browser_search_engine
+
+            _query_browser_search_engine(
+                {"name": "bing", "url_template": "https://www.bing.com/search?q={query}"},
+                "Example Domain",
+                3,
+                deadline=5.0,
+            )
+
+        open_timeout = run_session.call_args_list[0].kwargs["timeout"]
+        eval_timeout = run_session.call_args_list[1].kwargs["timeout"]
+        assert open_timeout == 5
+        assert 1 <= eval_timeout <= 5
+
     def test_browser_search_retries_primary_query_once_on_transient_failure(self):
         strong = {
             "success": True,
