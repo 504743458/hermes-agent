@@ -49,6 +49,7 @@ import base64
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
@@ -109,6 +110,7 @@ from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 _BROWSER_FALLBACK_LOCK = threading.Lock()
+_BROWSER_SEARCH_TIME_BUDGET_SECONDS = 15.0
 _BROWSER_SEARCH_ENGINES = (
     {"name": "bing", "url_template": "https://www.bing.com/search?q={query}"},
     {"name": "duckduckgo_html", "url_template": "https://duckduckgo.com/html/?q={query}"},
@@ -124,6 +126,14 @@ _BROWSER_SEARCH_BREADCRUMB_PREFIX_RE = re.compile(
     r'^(?:[\w.-]+)?https?://\S+(?:\s*›\s*\S+)*\s*',
     re.IGNORECASE,
 )
+_TECH_RESULT_HINTS = (
+    "docs", "documentation", "tutorial", "guide", "reference", "api",
+    "github", "stack overflow", "stackoverflow", "readthedocs", "python",
+)
+_QUERY_STOPWORDS = {
+    "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "with",
+    "what", "how", "is", "are", "official", "site", "docs", "documentation",
+}
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -427,14 +437,139 @@ def _is_browser_search_engine_internal(url: str, engine: str) -> bool:
     return False
 
 
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _cjk_char_count(text: str) -> int:
+    return sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+
+
+def _query_prefers_english_results(query: str) -> bool:
+    letters = [ch for ch in query if ch.isalpha()]
+    if not letters:
+        return False
+    ascii_letters = [ch for ch in letters if ord(ch) < 128]
+    return len(ascii_letters) / max(1, len(letters)) >= 0.8 and not _contains_cjk(query)
+
+
+def _query_looks_technical(query: str) -> bool:
+    lowered = query.casefold()
+    technical_markers = (
+        "python", "asyncio", "javascript", "typescript", "react", "api",
+        "github", "docs", "documentation", "tutorial", "guide", "sdk",
+        "sql", "docker", "linux", "http", "json",
+    )
+    return any(marker in lowered for marker in technical_markers)
+
+
+def _query_has_github_intent(query: str) -> bool:
+    lowered = query.casefold()
+    return any(marker in lowered for marker in ("github", "repo", "repository"))
+
+
+def _query_has_docs_intent(query: str) -> bool:
+    lowered = query.casefold()
+    return any(marker in lowered for marker in ("docs", "documentation", "reference", "api"))
+
+
+def _query_has_tutorial_intent(query: str) -> bool:
+    lowered = query.casefold()
+    return any(marker in lowered for marker in ("tutorial", "guide", "how to", "how-to", "learn"))
+
+
+def _browser_query_terms(query: str) -> List[str]:
+    tokens = re.findall(r"[a-z0-9]+", query.casefold())
+    terms = [token for token in tokens if len(token) >= 3 and token not in _QUERY_STOPWORDS]
+    return list(dict.fromkeys(terms))
+
+
+def _browser_result_relevance_score(result: Dict[str, Any], query: str) -> int:
+    terms = _browser_query_terms(query)
+    if not terms:
+        return 0
+    blob = f"{result.get('title', '')} {result.get('description', '')} {result.get('url', '')}".casefold()
+    score = 0
+    for term in terms:
+        if term in blob:
+            score += 2 if term in str(result.get("title", "")).casefold() else 1
+    return score
+
+
+def _result_matches_query_intent(result: Dict[str, Any], query: str) -> bool:
+    blob = f"{result.get('title', '')} {result.get('description', '')} {result.get('url', '')}".casefold()
+
+    if _query_has_github_intent(query):
+        return "github" in blob or "github.com" in blob
+    if _query_has_docs_intent(query):
+        return any(marker in blob for marker in ("docs", "documentation", "reference", "api"))
+    if _query_has_tutorial_intent(query):
+        return any(marker in blob for marker in ("tutorial", "guide", "how to", "how-to", "learn", "docs"))
+    return True
+
+
+def _is_generic_support_noise(url: str, query: str) -> bool:
+    lowered_query = query.casefold()
+    lowered_url = url.casefold()
+    generic_support_hosts = (
+        "support.google.com",
+        "accounts.google.com",
+        "workspace.google.com",
+        "mail.google.com",
+    )
+    allowed_markers = ("google", "gmail", "chrome", "analytics", "account", "mail")
+    return any(host in lowered_url for host in generic_support_hosts) and not any(marker in lowered_query for marker in allowed_markers)
+
+
+def _build_browser_search_query_variants(query: str) -> List[str]:
+    variants = [query.strip()]
+    lowered = query.casefold()
+
+    if _query_has_github_intent(query):
+        stripped = re.sub(r"\b(github|repo|repository)\b", "", query, flags=re.IGNORECASE).strip()
+        if stripped:
+            variants.append(f"site:github.com {stripped}")
+            variants.append(f"{stripped} official repository")
+
+    if _query_looks_technical(query):
+        variants.append(f"{query} official documentation")
+        variants.append(f"{query} docs")
+        if "python" in lowered:
+            stripped = re.sub(r"\b(tutorial|guide|docs|documentation)\b", "", query, flags=re.IGNORECASE).strip()
+            if stripped:
+                variants.append(f"site:docs.python.org {stripped}")
+                variants.append(f"site:realpython.com {stripped}")
+        if _query_has_tutorial_intent(query):
+            stripped = re.sub(r"\b(tutorial|guide|docs|documentation)\b", "", query, flags=re.IGNORECASE).strip()
+            if stripped:
+                variants.append(f"\"{stripped}\" tutorial")
+
+    if len(query.split()) <= 4:
+        variants.append(f"\"{query}\"")
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        cleaned = re.sub(r"\s+", " ", variant).strip()
+        key = cleaned.casefold()
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cleaned)
+    return deduped[:4]
+
+
 def _normalize_browser_search_candidates(
     candidates: List[Dict[str, Any]],
     *,
     engine: str,
     limit: int,
+    query: str = "",
 ) -> List[Dict[str, Any]]:
     """Filter, unwrap, dedupe, and rank raw browser search candidates."""
     best_by_url: Dict[str, Dict[str, Any]] = {}
+    prefer_english = _query_prefers_english_results(query)
+    technical_query = _query_looks_technical(query)
 
     for item in candidates:
         if not isinstance(item, dict):
@@ -457,8 +592,15 @@ def _normalize_browser_search_candidates(
             continue
         if _is_browser_search_engine_internal(url, engine):
             continue
+        if _is_generic_support_noise(url, query):
+            continue
         if len(title) < 3:
             continue
+        if prefer_english:
+            if _cjk_char_count(title) >= 2:
+                continue
+            if _cjk_char_count(description) >= 8:
+                continue
 
         score = 0
         if len(title) >= 12:
@@ -469,6 +611,30 @@ def _normalize_browser_search_candidates(
             score += 2
         elif len(description) >= 12:
             score += 1
+
+        domain_text = f"{title} {description} {url}".casefold()
+        if technical_query and any(marker in domain_text for marker in _TECH_RESULT_HINTS):
+            score += 2
+        if _query_has_github_intent(query) and "github.com" in url.casefold():
+            score += 4
+        if (_query_has_tutorial_intent(query) or _query_has_docs_intent(query)) and "stackoverflow.com" in url.casefold():
+            score -= 6
+        if _query_has_tutorial_intent(query) and title.casefold().startswith(("what does", "is there", "slice -", "syntax -")):
+            score -= 4
+        if prefer_english:
+            if _contains_cjk(title):
+                score -= 3
+            if _contains_cjk(description):
+                score -= 2
+        if title.count("/") >= 2 or title.count("http") >= 1:
+            score -= 2
+
+        score += _browser_result_relevance_score(
+            {"title": title, "description": description, "url": url},
+            query,
+        )
+        if not _result_matches_query_intent({"title": title, "description": description, "url": url}, query):
+            score -= 4
 
         if score < 2:
             continue
@@ -556,7 +722,61 @@ def _search_results_meet_threshold(results: List[Dict[str, Any]], limit: int) ->
     return len(results) >= minimum
 
 
-def _browser_search_results_are_weak(results: List[Dict[str, Any]], limit: int) -> bool:
+def _browser_search_quality_score(results: List[Dict[str, Any]], query: str = "") -> int:
+    score = 0
+    technical_query = _query_looks_technical(query)
+    prefer_english = _query_prefers_english_results(query)
+    for result in results:
+        title = str(result.get("title", "")).strip()
+        description = str(result.get("description", "")).strip()
+        blob = f"{title} {description} {result.get('url', '')}".casefold()
+        score += _browser_result_relevance_score(result, query) * 2
+        if description:
+            score += 1
+        if len(title) >= 20:
+            score += 1
+        if technical_query and any(marker in blob for marker in _TECH_RESULT_HINTS):
+            score += 2
+        if query and not _result_matches_query_intent(result, query):
+            score -= 4
+        if prefer_english and (_contains_cjk(title) or _contains_cjk(description)):
+            score -= 3
+    return score
+
+
+def _merge_browser_search_results(
+    primary: List[Dict[str, Any]],
+    secondary: List[Dict[str, Any]],
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+
+    def merge_in(items: List[Dict[str, Any]]) -> None:
+        for item in items:
+            url = str(item.get("url", "")).strip()
+            if not url:
+                continue
+            existing = merged.get(url)
+            if existing is None:
+                merged[url] = dict(item)
+                continue
+            if len(str(item.get("description", "")).strip()) > len(str(existing.get("description", "")).strip()):
+                existing["description"] = item.get("description", "")
+            if len(str(item.get("title", "")).strip()) > len(str(existing.get("title", "")).strip()):
+                existing["title"] = item.get("title", "")
+
+    merge_in(primary)
+    merge_in(secondary)
+
+    items = list(merged.values())
+    items.sort(key=lambda entry: int(entry.get("position", 9999)))
+    for idx, item in enumerate(items[:limit], start=1):
+        item["position"] = idx
+    return items[:limit]
+
+
+def _browser_search_results_are_weak(results: List[Dict[str, Any]], limit: int, query: str = "") -> bool:
     if not _search_results_meet_threshold(results, limit):
         return True
 
@@ -569,11 +789,73 @@ def _browser_search_results_are_weak(results: List[Dict[str, Any]], limit: int) 
             continue
         if "http://" in title or "https://" in title or ".com" in title or ".org" in title:
             weak_count += 1
+            continue
+        if query and _browser_result_relevance_score(result, query) <= 1:
+            weak_count += 1
+            continue
+        if query and not _result_matches_query_intent(result, query):
+            weak_count += 1
 
     return weak_count >= max(1, len(results))
 
 
-def _browser_search_eval_script(limit: int) -> str:
+def _browser_search_eval_script(engine: str, limit: int) -> str:
+    if engine == "bing":
+        return f"""(() => {{
+          const limit = {max(8, min(limit * 8, 48))};
+          const cleanText = (value) => (value || "")
+            .replace(/\\r/g, "")
+            .replace(/[ \\t]+/g, " ")
+            .replace(/\\n{{3,}}/g, "\\n\\n")
+            .trim();
+          const blocks = Array.from(document.querySelectorAll("li.b_algo, .b_algo"));
+          const results = [];
+          const seen = new Set();
+          for (const block of blocks) {{
+            const link = block.querySelector("h2 a[href], a[href]");
+            if (!link) continue;
+            const href = link.getAttribute("href") || "";
+            const headingNode = block.querySelector("h2, h3");
+            const heading = cleanText(headingNode ? (headingNode.innerText || headingNode.textContent || "") : "");
+            const title = cleanText(link.innerText || link.textContent || "");
+            const snippetNode = block.querySelector(".b_caption p, .b_snippet, p");
+            const description = cleanText(snippetNode ? (snippetNode.innerText || snippetNode.textContent || "") : "");
+            const key = href + "||" + (heading || title);
+            if (!href || seen.has(key)) continue;
+            seen.add(key);
+            results.push({{ title, heading, url: href, description }});
+            if (results.length >= limit) break;
+          }}
+          return results;
+        }})()"""
+
+    if engine.startswith("duckduckgo"):
+        return f"""(() => {{
+          const limit = {max(8, min(limit * 8, 48))};
+          const cleanText = (value) => (value || "")
+            .replace(/\\r/g, "")
+            .replace(/[ \\t]+/g, " ")
+            .replace(/\\n{{3,}}/g, "\\n\\n")
+            .trim();
+          const blocks = Array.from(document.querySelectorAll(".result, .results_links, .result__body"));
+          const results = [];
+          const seen = new Set();
+          for (const block of blocks) {{
+            const link = block.querySelector("a.result__a, a.result-link, h2 a[href], a[href]");
+            if (!link) continue;
+            const href = link.getAttribute("href") || "";
+            const title = cleanText(link.innerText || link.textContent || "");
+            const snippetNode = block.querySelector(".result__snippet, .snippet, .result-snippet, td.result-snippet, p");
+            const description = cleanText(snippetNode ? (snippetNode.innerText || snippetNode.textContent || "") : "");
+            const key = href + "||" + title;
+            if (!href || !title || seen.has(key)) continue;
+            seen.add(key);
+            results.push({{ title, heading: title, url: href, description }});
+            if (results.length >= limit) break;
+          }}
+          return results;
+        }})()"""
+
     return f"""(() => {{
       const limit = {max(8, min(limit * 8, 48))};
       const cleanText = (value) => (value || "")
@@ -611,74 +893,91 @@ def _query_browser_search_engine(engine: Dict[str, str], query: str, limit: int)
     search_url = engine["url_template"].format(query=quote_plus(query))
     last_error: Optional[Exception] = None
 
-    for _attempt in range(2):
-        session_name = f"websearch-{uuid.uuid4().hex[:8]}"
-        raw_candidates: List[Dict[str, Any]] = []
-        results: List[Dict[str, Any]] = []
+    session_name = f"websearch-{uuid.uuid4().hex[:8]}"
+    raw_candidates: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
 
-        with _BROWSER_FALLBACK_LOCK:
+    with _BROWSER_FALLBACK_LOCK:
+        try:
+            nav = _run_agent_browser_session_json(session_name, "open", [search_url], timeout=20)
+            if not nav.get("success"):
+                raise ValueError(nav.get("error") or "search navigation failed")
+
+            script = _browser_search_eval_script(engine["name"], limit)
+            encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+            evaluated = _run_agent_browser_session_json(session_name, "eval", ["-b", encoded], timeout=15)
+            if evaluated.get("success"):
+                payload = _browser_result_data(evaluated).get("result")
+                if isinstance(payload, list):
+                    raw_candidates = payload
+
+            results = _normalize_browser_search_candidates(
+                raw_candidates,
+                engine=engine["name"],
+                limit=limit,
+                query=query,
+            )
+
+            if engine["name"] == "bing" and raw_candidates and _browser_search_results_are_weak(results, limit, query=query):
+                snapshot_payload = _run_agent_browser_session_json(session_name, "snapshot", ["-c"], timeout=12)
+                snapshot_text = _browser_result_data(snapshot_payload).get("snapshot", "")
+                snapshot_candidates = _extract_search_results_from_snapshot(
+                    snapshot_text,
+                    raw_candidates,
+                    limit=limit,
+                )
+                snapshot_results = _normalize_browser_search_candidates(
+                    snapshot_candidates,
+                    engine=engine["name"],
+                    limit=limit,
+                    query=query,
+                )
+                results = _merge_browser_search_results(results, snapshot_results, limit=limit)
+
+            return {
+                "success": True,
+                "data": {
+                    "web": results,
+                    "engine": engine["name"],
+                },
+            }
+        except Exception as exc:
+            last_error = exc
+        finally:
             try:
-                nav = _run_agent_browser_session_json(session_name, "open", [search_url], timeout=45)
-                if not nav.get("success"):
-                    raise ValueError(nav.get("error") or "search navigation failed")
-
-                script = _browser_search_eval_script(limit)
-                encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
-                evaluated = _run_agent_browser_session_json(session_name, "eval", ["-b", encoded], timeout=30)
-                if evaluated.get("success"):
-                    payload = _browser_result_data(evaluated).get("result")
-                    if isinstance(payload, list):
-                        raw_candidates = payload
-
-                results = _normalize_browser_search_candidates(raw_candidates, engine=engine["name"], limit=limit)
-
-                if _browser_search_results_are_weak(results, limit):
-                    snapshot_payload = _run_agent_browser_session_json(session_name, "snapshot", ["-c"], timeout=30)
-                    snapshot_text = _browser_result_data(snapshot_payload).get("snapshot", "")
-                    snapshot_candidates = _extract_search_results_from_snapshot(
-                        snapshot_text,
-                        raw_candidates,
-                        limit=limit,
-                    )
-                    snapshot_results = _normalize_browser_search_candidates(
-                        snapshot_candidates,
-                        engine=engine["name"],
-                        limit=limit,
-                    )
-                    if len(snapshot_results) >= len(results):
-                        results = snapshot_results
-
-                return {
-                    "success": True,
-                    "data": {
-                        "web": results,
-                        "engine": engine["name"],
-                    },
-                }
-            except Exception as exc:
-                last_error = exc
-            finally:
-                try:
-                    _run_agent_browser_session_json(session_name, "close", [], timeout=20)
-                except Exception:
-                    logger.debug("agent-browser close failed for search engine %s", engine["name"], exc_info=True)
+                _run_agent_browser_session_json(session_name, "close", [], timeout=10)
+            except Exception:
+                logger.debug("agent-browser close failed for search engine %s", engine["name"], exc_info=True)
 
     raise ValueError(f"{engine['name']} search failed: {last_error}")
 
 
 def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
     """Run a no-key web search via a session-scoped browser strategy."""
-    best_response: Optional[Dict[str, Any]] = None
-    best_count = -1
+    best_response: Dict[str, Any] = {"success": True, "data": {"web": []}}
+    best_score = 0
+    started_at = time.monotonic()
+    query_variants = _build_browser_search_query_variants(query)[:2]
 
-    for engine in _BROWSER_SEARCH_ENGINES:
+    primary_engine = _BROWSER_SEARCH_ENGINES[0]
+    fallback_engines = _BROWSER_SEARCH_ENGINES[1:]
+    if _query_has_tutorial_intent(query) or _query_has_docs_intent(query):
+        fallback_engines = ()
+
+    for variant in query_variants:
+        if time.monotonic() - started_at > _BROWSER_SEARCH_TIME_BUDGET_SECONDS:
+            break
         try:
-            response = _query_browser_search_engine(engine, query, limit)
+            response = _query_browser_search_engine(primary_engine, variant, limit)
         except Exception as exc:
-            logger.debug("browser search engine %s failed: %s", engine["name"], exc)
+            logger.debug("browser search engine %s failed for variant %s: %s", primary_engine["name"], variant, exc)
             continue
         results = response.get("data", {}).get("web", [])
-        if _search_results_meet_threshold(results, limit):
+        score = _browser_search_quality_score(results, variant)
+        if score > best_score:
+            best_response = response
+            best_score = score
+        if _search_results_meet_threshold(results, limit) and not _browser_search_results_are_weak(results, limit, query=variant):
             return {
                 "success": True,
                 "data": {
@@ -686,12 +985,30 @@ def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
                 },
             }
 
-        if len(results) > best_count:
-            best_response = response
-            best_count = len(results)
-
-    if best_response is None:
-        best_response = {"success": True, "data": {"web": []}}
+    fallback_variants = query_variants[:1]
+    for engine in fallback_engines:
+        for variant in fallback_variants:
+            if time.monotonic() - started_at > _BROWSER_SEARCH_TIME_BUDGET_SECONDS:
+                break
+            try:
+                response = _query_browser_search_engine(engine, variant, limit)
+            except Exception as exc:
+                logger.debug("browser search engine %s failed for variant %s: %s", engine["name"], variant, exc)
+                continue
+            results = response.get("data", {}).get("web", [])
+            score = _browser_search_quality_score(results, variant)
+            if score > best_score:
+                best_response = response
+                best_score = score
+            if _search_results_meet_threshold(results, limit) and not _browser_search_results_are_weak(results, limit, query=variant):
+                return {
+                    "success": True,
+                    "data": {
+                        "web": results,
+                    },
+                }
+        if time.monotonic() - started_at > _BROWSER_SEARCH_TIME_BUDGET_SECONDS:
+            break
 
     return {
         "success": True,
