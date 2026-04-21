@@ -47,7 +47,10 @@ import re
 import asyncio
 import base64
 import subprocess
+import tempfile
 import threading
+import uuid
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 import httpx
 from firecrawl import Firecrawl
@@ -68,6 +71,21 @@ from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 _BROWSER_FALLBACK_LOCK = threading.Lock()
+_BROWSER_SEARCH_ENGINES = (
+    {"name": "bing", "url_template": "https://www.bing.com/search?q={query}"},
+    {"name": "duckduckgo_html", "url_template": "https://duckduckgo.com/html/?q={query}"},
+    {"name": "duckduckgo_lite", "url_template": "https://lite.duckduckgo.com/lite/?q={query}"},
+)
+_BROWSER_SEARCH_BAD_TITLES = {
+    "all", "images", "video", "videos", "maps", "more", "search",
+    "duckduckgo", "google", "bing",
+    "全部", "搜索", "图片", "视频", "地图", "更多", "跳至内容", "辅助功能反馈",
+    "english", "māori",
+}
+_BROWSER_SEARCH_BREADCRUMB_PREFIX_RE = re.compile(
+    r'^(?:[\w.-]+)?https?://\S+(?:\s*›\s*\S+)*\s*',
+    re.IGNORECASE,
+)
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -205,119 +223,401 @@ def _run_agent_browser_json(command: str, args: Optional[List[str]] = None, time
     return _parse_browser_result(stdout, f"agent-browser {command}")
 
 
-def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
-    """Run a no-key web search via the browser tool path."""
-    from urllib.parse import quote_plus
+def _run_agent_browser_session_json(
+    session_name: str,
+    command: str,
+    args: Optional[List[str]] = None,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    """Run agent-browser with an explicit session, without Hermes socket-dir wrapping."""
+    cmd = _find_agent_browser_cli() + ["--session", session_name, "--json", command] + (args or [])
+    temp_dir = os.path.join(tempfile.gettempdir(), f"web-search-{session_name}")
+    os.makedirs(temp_dir, exist_ok=True)
+    stdout_path = os.path.join(temp_dir, f"{command}.stdout")
+    stderr_path = os.path.join(temp_dir, f"{command}.stderr")
 
-    search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
-    with _BROWSER_FALLBACK_LOCK:
-        nav = _run_agent_browser_json("open", [search_url])
-        if not nav.get("success"):
-            raise ValueError(nav.get("error") or "Browser search navigation failed")
+    stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=stdout_fd,
+            stderr=stderr_fd,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ},
+        )
+    finally:
+        os.close(stdout_fd)
+        os.close(stderr_fd)
 
-        expression = f"""(() => {{
-          const limit = {max(1, min(limit, 10))};
-          const cleanText = (value) => (value || "")
-            .replace(/\\r/g, "")
-            .replace(/[ \\t]+/g, " ")
-            .replace(/\\n{{3,}}/g, "\\n\\n")
-            .trim();
-          const normalizeUrl = (href) => {{
-            try {{
-              const resolved = new URL(href, window.location.href);
-              const redirected = resolved.searchParams.get("uddg");
-              if (redirected) return decodeURIComponent(redirected);
-              return resolved.href;
-            }} catch (_err) {{
-              return href || "";
-            }}
-          }};
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise ValueError(f"agent-browser session command timed out: {command}")
 
-          const selectors = [
-            ".result",
-            ".results_links",
-            ".result__body",
-            "article",
-            "[data-testid='result']",
-          ];
-          const containers = [];
-          for (const selector of selectors) {{
-            for (const node of document.querySelectorAll(selector)) {{
-              if (!containers.includes(node)) containers.push(node);
-            }}
-          }}
-          if (!containers.length) containers.push(document.body);
-
-          const results = [];
-          const seen = new Set();
-          for (const container of containers) {{
-            const link = container.querySelector("a.result__a, h2 a, a[href]");
-            if (!link) continue;
-
-            const url = normalizeUrl(link.getAttribute("href") || "");
-            const lowerUrl = url.toLowerCase();
-            if (!(lowerUrl.startsWith("http://") || lowerUrl.startsWith("https://"))) continue;
-            if (lowerUrl.includes("duckduckgo.com/") && !lowerUrl.includes("/l/")) continue;
-            if (seen.has(url)) continue;
-
-            const title = cleanText(link.innerText || link.textContent || "");
-            if (!title) continue;
-
-            const snippetNode = container.querySelector(".result__snippet, .snippet, .result-snippet, p");
-            let description = cleanText(snippetNode ? (snippetNode.innerText || snippetNode.textContent || "") : "");
-            if (!description) {{
-              description = cleanText((container.innerText || container.textContent || "").replace(title, ""));
-            }}
-
-            seen.add(url);
-            results.push({{
-              title,
-              url,
-              description,
-              position: results.length + 1,
-            }});
-
-            if (results.length >= limit) break;
-          }}
-
-          return results;
-        }})()"""
-        encoded = base64.b64encode(expression.encode("utf-8")).decode("ascii")
-        try:
-            evaluated = _run_agent_browser_json("eval", ["-b", encoded])
-        finally:
+    try:
+        stdout = Path(stdout_path).read_text(encoding="utf-8", errors="replace").strip()
+    finally:
+        for path in (stdout_path, stderr_path):
             try:
-                _run_agent_browser_json("close", [], timeout=15)
-            except Exception:
-                logger.debug("agent-browser close failed after search fallback", exc_info=True)
+                os.unlink(path)
+            except OSError:
+                pass
 
-        if not evaluated.get("success"):
-            raise ValueError(evaluated.get("error") or "Browser search extraction failed")
+    if proc.returncode != 0:
+        raise ValueError(f"agent-browser session command failed: {command}")
+    if not stdout:
+        raise ValueError(f"agent-browser session command returned no output: {command}")
+    return _parse_browser_result(stdout, f"agent-browser session {command}")
 
-    raw_results = _browser_result_data(evaluated).get("result")
-    if not isinstance(raw_results, list):
-        raise ValueError("Browser search extraction returned an invalid result list")
 
-    results = []
-    for idx, item in enumerate(raw_results[:limit], start=1):
+def _decode_bing_redirect(value: str) -> str:
+    candidate = value
+    if candidate.startswith("a1"):
+        candidate = candidate[2:]
+        padding = "=" * (-len(candidate) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode(candidate + padding).decode("utf-8")
+            if decoded.startswith(("http://", "https://")):
+                return decoded
+        except Exception:
+            pass
+    return value
+
+
+def _unwrap_browser_search_url(raw_url: str) -> str:
+    """Unwrap common search-engine redirect URLs into direct targets when possible."""
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    url = (raw_url or "").strip()
+    if not url:
+        return ""
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+
+    host = (parsed.netloc or "").lower()
+    qs = parse_qs(parsed.query or "")
+
+    if "bing.com" in host:
+        redirected = qs.get("u", [None])[0]
+        if redirected:
+            redirected = _decode_bing_redirect(redirected)
+            redirected = unquote(redirected)
+            if redirected.startswith(("http://", "https://")):
+                return redirected
+
+    if "google." in host and parsed.path == "/url":
+        redirected = qs.get("q", [None])[0]
+        if redirected:
+            redirected = unquote(redirected)
+            if redirected.startswith(("http://", "https://")):
+                return redirected
+
+    if "duckduckgo.com" in host:
+        redirected = qs.get("uddg", [None])[0]
+        if redirected:
+            redirected = unquote(redirected)
+            if redirected.startswith(("http://", "https://")):
+                return redirected
+
+    return url
+
+
+def _is_browser_search_engine_internal(url: str, engine: str) -> bool:
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+
+    if engine == "bing" and "bing.com" in host:
+        return path.startswith(("/search", "/copilotsearch", "/images", "/videos", "/maps"))
+    if engine.startswith("duckduckgo") and "duckduckgo.com" in host:
+        return True
+    if engine == "google" and "google." in host:
+        return path.startswith(("/search", "/imgres", "/preferences", "/setprefs", "/advanced_search"))
+    return False
+
+
+def _normalize_browser_search_candidates(
+    candidates: List[Dict[str, Any]],
+    *,
+    engine: str,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Filter, unwrap, dedupe, and rank raw browser search candidates."""
+    best_by_url: Dict[str, Dict[str, Any]] = {}
+
+    for item in candidates:
         if not isinstance(item, dict):
             continue
-        url = str(item.get("url", "")).strip()
-        title = str(item.get("title", "")).strip()
-        description = str(item.get("description", "")).strip()
+
+        raw_title = re.sub(r"\s+", " ", str(item.get("title", "")).strip())
+        heading = re.sub(r"\s+", " ", str(item.get("heading", "")).strip())
+        description = re.sub(r"\s+", " ", str(item.get("description", "")).strip())
+        url = _unwrap_browser_search_url(str(item.get("url", "")).strip())
+        title = heading or raw_title
+        if heading and (".com" in raw_title.lower() or "http" in raw_title.lower() or len(heading) < len(raw_title)):
+            title = heading
+        title = _BROWSER_SEARCH_BREADCRUMB_PREFIX_RE.sub("", title).strip(" -:|›")
+        description = _BROWSER_SEARCH_BREADCRUMB_PREFIX_RE.sub("", description).strip(" -:|›")
+        title_key = title.casefold()
+
         if not url or not title:
             continue
-        results.append({
+        if title_key in _BROWSER_SEARCH_BAD_TITLES:
+            continue
+        if _is_browser_search_engine_internal(url, engine):
+            continue
+        if len(title) < 3:
+            continue
+
+        score = 0
+        if len(title) >= 12:
+            score += 2
+        elif len(title) >= 5:
+            score += 1
+        if len(description) >= 40:
+            score += 2
+        elif len(description) >= 12:
+            score += 1
+
+        if score < 2:
+            continue
+
+        candidate = {
             "title": title,
             "url": url,
             "description": description,
-            "position": idx,
-        })
+            "_score": score,
+        }
+        existing = best_by_url.get(url)
+        if existing is None or candidate["_score"] > existing["_score"] or len(candidate["title"]) > len(existing["title"]):
+            best_by_url[url] = candidate
+
+    results = list(best_by_url.values())
+    results.sort(key=lambda item: (-int(item.get("_score", 0)), item["title"]))
+    trimmed = []
+    for idx, item in enumerate(results[:limit], start=1):
+        trimmed.append(
+            {
+                "title": item["title"],
+                "url": item["url"],
+                "description": item["description"],
+                "position": idx,
+            }
+        )
+    return trimmed
+
+
+def _extract_search_results_from_snapshot(
+    snapshot_text: str,
+    anchors: List[Dict[str, Any]],
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Parse stable result blocks from the accessibility snapshot and map them to URLs."""
+    anchor_map: Dict[str, Dict[str, Any]] = {}
+    for anchor in anchors:
+        for candidate_title in (
+            str(anchor.get("heading", "")).strip(),
+            str(anchor.get("title", "")).strip(),
+        ):
+            if candidate_title:
+                anchor_map.setdefault(candidate_title.casefold(), anchor)
+
+    results: List[Dict[str, Any]] = []
+    blocks = re.split(r"\n\s*-\s+listitem", snapshot_text or "")
+    seen_urls: set[str] = set()
+
+    for block in blocks:
+        title_match = re.search(r'heading "([^"]+)"', block)
+        if not title_match:
+            title_match = re.search(r'link "([^"]+)"', block)
+        if not title_match:
+            continue
+
+        title = title_match.group(1).strip()
+        anchor = anchor_map.get(title.casefold())
+        if not anchor:
+            continue
+
+        description_parts = [part.strip() for part in re.findall(r'StaticText "([^"]+)"', block) if part.strip()]
+        description = " ".join(description_parts).strip()
+        url = str(anchor.get("url", "")).strip()
+        if not url or url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "description": description,
+                "position": len(results) + 1,
+            }
+        )
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def _search_results_meet_threshold(results: List[Dict[str, Any]], limit: int) -> bool:
+    minimum = 1 if limit <= 1 else min(2, limit)
+    return len(results) >= minimum
+
+
+def _browser_search_results_are_weak(results: List[Dict[str, Any]], limit: int) -> bool:
+    if not _search_results_meet_threshold(results, limit):
+        return True
+
+    weak_count = 0
+    for result in results:
+        title = str(result.get("title", "")).strip().lower()
+        description = str(result.get("description", "")).strip()
+        if not description:
+            weak_count += 1
+            continue
+        if "http://" in title or "https://" in title or ".com" in title or ".org" in title:
+            weak_count += 1
+
+    return weak_count >= max(1, len(results))
+
+
+def _browser_search_eval_script(limit: int) -> str:
+    return f"""(() => {{
+      const limit = {max(8, min(limit * 8, 48))};
+      const cleanText = (value) => (value || "")
+        .replace(/\\r/g, "")
+        .replace(/[ \\t]+/g, " ")
+        .replace(/\\n{{3,}}/g, "\\n\\n")
+        .trim();
+      const anchors = Array.from(document.querySelectorAll("a[href]"));
+      const seen = new Set();
+      const results = [];
+      for (const anchor of anchors) {{
+        const href = anchor.getAttribute("href") || "";
+        const container = anchor.closest("li, article, main, section, div");
+        const headingNode = container ? container.querySelector("h1, h2, h3") : null;
+        const heading = cleanText(headingNode ? (headingNode.innerText || headingNode.textContent || "") : "");
+        const title = cleanText(anchor.innerText || anchor.textContent || "");
+        if (!href || !(title || heading)) continue;
+        const containerText = cleanText(container ? (container.innerText || container.textContent || "") : "");
+        let description = containerText.replace(heading || title, "").trim();
+        if (description.length > 320) description = description.slice(0, 320);
+        const key = href + "||" + title;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        results.push({{ title, heading, url: href, description }});
+        if (results.length >= limit) break;
+      }}
+      return results;
+    }})()"""
+
+
+def _query_browser_search_engine(engine: Dict[str, str], query: str, limit: int) -> Dict[str, Any]:
+    """Query one browser-search engine and return the best normalized result set."""
+    from urllib.parse import quote_plus
+
+    search_url = engine["url_template"].format(query=quote_plus(query))
+    last_error: Optional[Exception] = None
+
+    for _attempt in range(2):
+        session_name = f"websearch-{uuid.uuid4().hex[:8]}"
+        raw_candidates: List[Dict[str, Any]] = []
+        results: List[Dict[str, Any]] = []
+
+        with _BROWSER_FALLBACK_LOCK:
+            try:
+                nav = _run_agent_browser_session_json(session_name, "open", [search_url], timeout=45)
+                if not nav.get("success"):
+                    raise ValueError(nav.get("error") or "search navigation failed")
+
+                script = _browser_search_eval_script(limit)
+                encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+                evaluated = _run_agent_browser_session_json(session_name, "eval", ["-b", encoded], timeout=30)
+                if evaluated.get("success"):
+                    payload = _browser_result_data(evaluated).get("result")
+                    if isinstance(payload, list):
+                        raw_candidates = payload
+
+                results = _normalize_browser_search_candidates(raw_candidates, engine=engine["name"], limit=limit)
+
+                if _browser_search_results_are_weak(results, limit):
+                    snapshot_payload = _run_agent_browser_session_json(session_name, "snapshot", ["-c"], timeout=30)
+                    snapshot_text = _browser_result_data(snapshot_payload).get("snapshot", "")
+                    snapshot_candidates = _extract_search_results_from_snapshot(
+                        snapshot_text,
+                        raw_candidates,
+                        limit=limit,
+                    )
+                    snapshot_results = _normalize_browser_search_candidates(
+                        snapshot_candidates,
+                        engine=engine["name"],
+                        limit=limit,
+                    )
+                    if len(snapshot_results) >= len(results):
+                        results = snapshot_results
+
+                return {
+                    "success": True,
+                    "data": {
+                        "web": results,
+                        "engine": engine["name"],
+                    },
+                }
+            except Exception as exc:
+                last_error = exc
+            finally:
+                try:
+                    _run_agent_browser_session_json(session_name, "close", [], timeout=20)
+                except Exception:
+                    logger.debug("agent-browser close failed for search engine %s", engine["name"], exc_info=True)
+
+    raise ValueError(f"{engine['name']} search failed: {last_error}")
+
+
+def _browser_search_tool(query: str, limit: int) -> Dict[str, Any]:
+    """Run a no-key web search via a session-scoped browser strategy."""
+    best_response: Optional[Dict[str, Any]] = None
+    best_count = -1
+
+    for engine in _BROWSER_SEARCH_ENGINES:
+        try:
+            response = _query_browser_search_engine(engine, query, limit)
+        except Exception as exc:
+            logger.debug("browser search engine %s failed: %s", engine["name"], exc)
+            continue
+        results = response.get("data", {}).get("web", [])
+        if _search_results_meet_threshold(results, limit):
+            return {
+                "success": True,
+                "data": {
+                    "web": results,
+                },
+            }
+
+        if len(results) > best_count:
+            best_response = response
+            best_count = len(results)
+
+    if best_response is None:
+        best_response = {"success": True, "data": {"web": []}}
 
     return {
         "success": True,
         "data": {
-            "web": results,
+            "web": best_response.get("data", {}).get("web", []),
         },
     }
 
