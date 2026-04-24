@@ -87,6 +87,22 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     assert runner._pending_messages == {}
     assert runner._pending_approvals == {}
     assert runner._shutdown_event.is_set() is True
+    assert adapter.prepared_for_shutdown is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_revokes_pending_gateway_approvals():
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 0.0
+    running_agent = MagicMock()
+    runner._running_agents = {"session-a": running_agent}
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await runner.stop()
+
+    mock_resolve.assert_called_once_with("session-a", "deny", resolve_all=True)
+    assert adapter.prepared_for_shutdown is True
 
 
 @pytest.mark.asyncio
