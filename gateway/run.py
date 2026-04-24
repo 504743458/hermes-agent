@@ -7817,13 +7817,13 @@ class GatewayRunner:
                         sent_buttons = False
                         if getattr(type(adapter), "send_update_prompt", None) is not None:
                             try:
-                                await adapter.send_update_prompt(
+                                _button_result = await adapter.send_update_prompt(
                                     chat_id=chat_id,
                                     prompt=prompt_text,
                                     default=default,
                                     session_key=session_key,
                                 )
-                                sent_buttons = True
+                                sent_buttons = bool(getattr(_button_result, "success", False))
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
