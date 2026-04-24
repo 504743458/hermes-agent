@@ -254,6 +254,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # Interactive button callback state keyed by random nonces.
         self._approval_state: Dict[str, Dict[str, Any]] = {}
         self._update_prompt_state: Dict[str, Dict[str, Any]] = {}
+        self._accepting_interactive_callbacks = True
+
+    def prepare_for_shutdown(self) -> None:
+        """Reject approval/update callbacks while the gateway is draining."""
+        self._accepting_interactive_callbacks = False
+        self._approval_state.clear()
+        self._update_prompt_state.clear()
 
     @staticmethod
     def _callback_allowed_ids() -> set[str]:
@@ -776,6 +783,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         
         try:
+            self._accepting_interactive_callbacks = True
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
@@ -1028,6 +1036,7 @@ class TelegramAdapter(BasePlatformAdapter):
     
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        self.prepare_for_shutdown()
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -1772,6 +1781,13 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        if (
+            not self._accepting_interactive_callbacks
+            and data.startswith(("ea:", "up:", "update_prompt:"))
+        ):
+            await query.answer(text="Gateway is restarting; please send the request again after it comes back.")
             return
 
         # --- Exec approval callbacks (ea:choice:nonce) ---
