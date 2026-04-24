@@ -3091,6 +3091,18 @@ class GatewayRunner:
             )
             self._running = False
             self._draining = True
+            for adapter in list(self.adapters.values()):
+                try:
+                    adapter.prepare_for_shutdown()
+                except Exception as e:
+                    logger.debug("Adapter shutdown preparation failed: %s", e)
+            try:
+                from tools.approval import resolve_gateway_approval
+
+                for session_key in list(self._running_agents.keys()):
+                    resolve_gateway_approval(session_key, "deny", resolve_all=True)
+            except Exception as e:
+                logger.debug("Failed to revoke pending gateway approvals during shutdown: %s", e)
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
@@ -8809,6 +8821,9 @@ class GatewayRunner:
         source = event.source
         session_key = self._session_key_for_source(source)
 
+        if self._draining:
+            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting approvals right now."
+
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
         )
@@ -8857,6 +8872,9 @@ class GatewayRunner:
         """
         source = event.source
         session_key = self._session_key_for_source(source)
+
+        if self._draining:
+            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting approvals right now."
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,

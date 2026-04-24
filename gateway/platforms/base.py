@@ -1359,6 +1359,16 @@ class BasePlatformAdapter(ABC):
         thread replies without explicit mentions).
         """
         self._session_store = session_store
+
+    def prepare_for_shutdown(self) -> None:
+        """Prepare adapter-owned interactive state for gateway shutdown.
+
+        Message polling may remain alive while the gateway drains active work.
+        Adapters that own approval buttons or other interactive callbacks can
+        override this hook to make those callbacks fail closed during that
+        drain window.
+        """
+        return None
     
     @abstractmethod
     async def connect(self) -> bool:
