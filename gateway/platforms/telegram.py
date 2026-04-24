@@ -314,16 +314,36 @@ class TelegramAdapter(BasePlatformAdapter):
         return {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
 
     @classmethod
-    def _callback_buttons_available(cls) -> bool:
-        return bool(cls._callback_allowed_ids())
+    def _is_pairing_approved(cls, user_id: str) -> bool:
+        if not user_id:
+            return False
+        try:
+            from gateway.pairing import PairingStore
+            return PairingStore().is_approved("telegram", str(user_id))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _session_is_dm(session_key: str) -> bool:
+        return ":dm:" in str(session_key or "")
+
+    @classmethod
+    def _callback_buttons_available(cls, chat_id: str = "", session_key: str = "") -> bool:
+        if cls._callback_allowed_ids():
+            return True
+        if cls._session_is_dm(session_key) and cls._is_pairing_approved(str(chat_id or "")):
+            return True
+        return False
 
     @classmethod
     def _is_callback_user_authorized(cls, user_id: str) -> bool:
         """Return whether a Telegram inline-button caller may perform gated actions."""
         allowed_ids = cls._callback_allowed_ids()
-        if not allowed_ids or not user_id:
+        if not user_id:
             return False
-        return "*" in allowed_ids or user_id in allowed_ids
+        if allowed_ids:
+            return "*" in allowed_ids or user_id in allowed_ids
+        return cls._is_pairing_approved(user_id)
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1455,7 +1475,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        if not self._callback_buttons_available():
+        if not self._callback_buttons_available(chat_id=chat_id, session_key=session_key):
             return SendResult(success=False, error="callback auth unavailable")
         try:
             default_hint = f" (default: {default})" if default else ""
@@ -1493,7 +1513,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        if not self._callback_buttons_available():
+        if not self._callback_buttons_available(chat_id=chat_id, session_key=session_key):
             return SendResult(success=False, error="callback auth unavailable")
 
         try:
