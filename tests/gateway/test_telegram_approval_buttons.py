@@ -1,6 +1,7 @@
 """Tests for Telegram inline keyboard approval buttons."""
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -59,6 +60,42 @@ def _make_adapter(extra=None):
     return adapter
 
 
+def _approval_state(session_key="agent:main:telegram:group:12345:99", chat_id="12345",
+                    message_id="42", expected_user_id=""):
+    return {
+        "session_key": session_key,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "expected_user_id": expected_user_id,
+        "expires_at": 4_102_444_800,
+    }
+
+
+def _update_prompt_state(chat_id="12345", session_key="agent:main:telegram:dm:12345",
+                         message_id="77", update_token="update-1", expected_user_id=""):
+    return {
+        "chat_id": chat_id,
+        "session_key": session_key,
+        "message_id": message_id,
+        "expected_user_id": expected_user_id,
+        "update_token": update_token,
+        "expires_at": 4_102_444_800,
+    }
+
+
+def _write_update_pending(tmp_path, chat_id="12345", session_key="agent:main:telegram:dm:12345",
+                          update_token="update-1"):
+    (tmp_path / ".update_pending.json").write_text(
+        json.dumps({
+            "platform": "telegram",
+            "chat_id": chat_id,
+            "session_key": session_key,
+            "timestamp": update_token,
+        }),
+        encoding="utf-8",
+    )
+
+
 # ===========================================================================
 # send_exec_approval — inline keyboard buttons
 # ===========================================================================
@@ -105,10 +142,13 @@ class TestTelegramExecApproval:
                 session_key="my-session-key",
             )
 
-        # The approval_id should map to the session_key
         assert len(adapter._approval_state) == 1
-        approval_id = list(adapter._approval_state.keys())[0]
-        assert adapter._approval_state[approval_id] == "my-session-key"
+        approval_nonce = list(adapter._approval_state.keys())[0]
+        approval_state = adapter._approval_state[approval_nonce]
+        assert len(approval_nonce) >= 16
+        assert approval_state["session_key"] == "my-session-key"
+        assert approval_state["chat_id"] == "12345"
+        assert approval_state["message_id"] == "42"
 
     @pytest.mark.asyncio
     async def test_sends_in_thread(self):
@@ -266,14 +306,13 @@ class TestTelegramApprovalCallback:
     @pytest.mark.asyncio
     async def test_resolves_approval_on_click(self):
         adapter = _make_adapter()
-        # Set up approval state
-        adapter._approval_state[1] = "agent:main:telegram:group:12345:99"
+        adapter._approval_state["nonce-a"] = _approval_state()
 
-        # Mock callback query
         query = AsyncMock()
-        query.data = "ea:once:1"
+        query.data = "ea:once:nonce-a"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.from_user = MagicMock()
         query.from_user.id = 111
         query.from_user.first_name = "Norbert"
@@ -293,17 +332,18 @@ class TestTelegramApprovalCallback:
         query.edit_message_text.assert_called_once()
 
         # State should be cleaned up
-        assert 1 not in adapter._approval_state
+        assert "nonce-a" not in adapter._approval_state
 
     @pytest.mark.asyncio
     async def test_deny_button(self):
         adapter = _make_adapter()
-        adapter._approval_state[2] = "some-session"
+        adapter._approval_state["nonce-b"] = _approval_state(session_key="some-session")
 
         query = AsyncMock()
-        query.data = "ea:deny:2"
+        query.data = "ea:deny:nonce-b"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.from_user = MagicMock()
         query.from_user.id = 111
         query.from_user.first_name = "Alice"
@@ -325,12 +365,12 @@ class TestTelegramApprovalCallback:
     @pytest.mark.asyncio
     async def test_already_resolved(self):
         adapter = _make_adapter()
-        # No state for approval_id 99 — already resolved
 
         query = AsyncMock()
-        query.data = "ea:once:99"
+        query.data = "ea:once:missing-nonce"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.from_user = MagicMock()
         query.from_user.id = 111
         query.from_user.first_name = "Bob"
@@ -344,11 +384,65 @@ class TestTelegramApprovalCallback:
             with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
                 await adapter._handle_callback_query(update, context)
 
-        # Should NOT resolve — already handled
         mock_resolve.assert_not_called()
-        # Should still ack with "already resolved" message
         query.answer.assert_called_once()
-        assert "already been resolved" in query.answer.call_args[1]["text"]
+        assert "expired" in query.answer.call_args[1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_approval_callback_rejects_wrong_message_context(self):
+        adapter = _make_adapter()
+        adapter._approval_state["nonce-c"] = _approval_state(message_id="42")
+
+        query = AsyncMock()
+        query.data = "ea:once:nonce-c"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 99
+        query.from_user = MagicMock()
+        query.from_user.id = 111
+        query.answer = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+                await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_not_called()
+        query.answer.assert_called_once()
+        assert "not valid" in query.answer.call_args[1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_approval_callback_rejects_paired_dm_user_mismatch(self):
+        adapter = _make_adapter()
+        adapter._approval_state["nonce-d"] = _approval_state(
+            session_key="agent:main:telegram:dm:12345",
+            chat_id="12345",
+            expected_user_id="12345",
+        )
+
+        query = AsyncMock()
+        query.data = "ea:once:nonce-d"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 42
+        query.from_user = MagicMock()
+        query.from_user.id = 999
+        query.answer = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.object(TelegramAdapter, "_is_pairing_approved", return_value=True):
+            with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+                await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_not_called()
+        query.answer.assert_called_once()
+        assert "not valid" in query.answer.call_args[1]["text"]
 
     @pytest.mark.asyncio
     async def test_model_picker_callback_not_affected(self):
@@ -377,11 +471,14 @@ class TestTelegramApprovalCallback:
     async def test_update_prompt_callback_rejects_when_allowlist_and_pairing_are_absent(self, tmp_path):
         """Update prompt buttons must not fail open when neither allowlist nor pairing authorizes them."""
         adapter = _make_adapter()
+        adapter._update_prompt_state["prompt-a"] = _update_prompt_state()
+        _write_update_pending(tmp_path)
 
         query = AsyncMock()
-        query.data = "update_prompt:y"
+        query.data = "up:y:prompt-a"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 77
         query.from_user = MagicMock()
         query.from_user.id = 123
         query.answer = AsyncMock()
@@ -407,13 +504,18 @@ class TestTelegramApprovalCallback:
     async def test_update_prompt_callback_allows_paired_user_when_allowlist_is_empty(self, tmp_path):
         """A paired Telegram DM user should still be able to click update prompt buttons."""
         adapter = _make_adapter()
+        adapter._update_prompt_state["prompt-b"] = _update_prompt_state(
+            expected_user_id="12345",
+        )
+        _write_update_pending(tmp_path)
 
         query = AsyncMock()
-        query.data = "update_prompt:y"
+        query.data = "up:y:prompt-b"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 77
         query.from_user = MagicMock()
-        query.from_user.id = 8685028645
+        query.from_user.id = 12345
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -433,14 +535,76 @@ class TestTelegramApprovalCallback:
         assert (tmp_path / ".update_response").read_text() == "y"
 
     @pytest.mark.asyncio
-    async def test_update_prompt_callback_rejects_unauthorized_user(self, tmp_path):
-        """Update prompt buttons should honor TELEGRAM_ALLOWED_USERS."""
+    async def test_update_prompt_callback_rejects_legacy_unbound_button(self, tmp_path):
         adapter = _make_adapter()
+        _write_update_pending(tmp_path)
 
         query = AsyncMock()
         query.data = "update_prompt:y"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 77
+        query.from_user = MagicMock()
+        query.from_user.id = 111
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
+            with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}):
+                await adapter._handle_callback_query(update, context)
+
+        query.answer.assert_called_once()
+        assert "expired" in query.answer.call_args[1]["text"]
+        query.edit_message_text.assert_not_called()
+        assert not (tmp_path / ".update_response").exists()
+
+    @pytest.mark.asyncio
+    async def test_update_prompt_callback_rejects_stale_update_token(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._update_prompt_state["prompt-stale"] = _update_prompt_state(
+            update_token="old-update",
+        )
+        _write_update_pending(tmp_path, update_token="new-update")
+
+        query = AsyncMock()
+        query.data = "up:y:prompt-stale"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 77
+        query.from_user = MagicMock()
+        query.from_user.id = 111
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
+            with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}):
+                await adapter._handle_callback_query(update, context)
+
+        query.answer.assert_called_once()
+        assert "not valid" in query.answer.call_args[1]["text"]
+        query.edit_message_text.assert_not_called()
+        assert not (tmp_path / ".update_response").exists()
+
+    @pytest.mark.asyncio
+    async def test_update_prompt_callback_rejects_unauthorized_user(self, tmp_path):
+        """Update prompt buttons should honor TELEGRAM_ALLOWED_USERS."""
+        adapter = _make_adapter()
+        adapter._update_prompt_state["prompt-c"] = _update_prompt_state()
+        _write_update_pending(tmp_path)
+
+        query = AsyncMock()
+        query.data = "up:y:prompt-c"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 77
         query.from_user = MagicMock()
         query.from_user.id = 222
         query.answer = AsyncMock()
@@ -463,11 +627,14 @@ class TestTelegramApprovalCallback:
     async def test_update_prompt_callback_allows_authorized_user(self, tmp_path):
         """Allowed Telegram users can still answer update prompt buttons."""
         adapter = _make_adapter()
+        adapter._update_prompt_state["prompt-d"] = _update_prompt_state()
+        _write_update_pending(tmp_path)
 
         query = AsyncMock()
-        query.data = "update_prompt:n"
+        query.data = "up:n:prompt-d"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 77
         query.from_user = MagicMock()
         query.from_user.id = 111
         query.answer = AsyncMock()
