@@ -142,11 +142,12 @@ class TestTelegramExecApproval:
         adapter = _make_adapter()
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": ""}, clear=False):
-            result = await adapter.send_exec_approval(
-                chat_id="12345",
-                command="rm -rf /important",
-                session_key="agent:main:telegram:group:12345:99",
-            )
+            with patch.object(TelegramAdapter, "_is_pairing_approved", return_value=False):
+                result = await adapter.send_exec_approval(
+                    chat_id="12345",
+                    command="rm -rf /important",
+                    session_key="agent:main:telegram:group:12345:99",
+                )
 
         assert result.success is False
         assert "callback auth" in result.error.lower()
@@ -157,15 +158,53 @@ class TestTelegramExecApproval:
         adapter = _make_adapter()
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": ""}, clear=False):
-            result = await adapter.send_update_prompt(
-                chat_id="12345",
-                prompt="Restore local changes?",
-                default="y",
-            )
+            with patch.object(TelegramAdapter, "_is_pairing_approved", return_value=False):
+                result = await adapter.send_update_prompt(
+                    chat_id="12345",
+                    prompt="Restore local changes?",
+                    default="y",
+                )
 
         assert result.success is False
         assert "callback auth" in result.error.lower()
         adapter._bot.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_allows_paired_dm_without_allowlist(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 42
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": ""}, clear=False):
+            with patch.object(TelegramAdapter, "_is_pairing_approved", return_value=True):
+                result = await adapter.send_exec_approval(
+                    chat_id="8685028645",
+                    command="echo test",
+                    session_key="agent:main:telegram:dm:8685028645",
+                )
+
+        assert result.success is True
+        adapter._bot.send_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_send_update_prompt_allows_paired_dm_without_allowlist(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 42
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": ""}, clear=False):
+            with patch.object(TelegramAdapter, "_is_pairing_approved", return_value=True):
+                result = await adapter.send_update_prompt(
+                    chat_id="8685028645",
+                    prompt="Restore local changes?",
+                    default="y",
+                    session_key="agent:main:telegram:dm:8685028645",
+                )
+
+        assert result.success is True
+        adapter._bot.send_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_disable_link_previews_sets_preview_kwargs(self):
@@ -204,11 +243,17 @@ class TestTelegramExecApproval:
 
     def test_callback_user_auth_requires_explicit_allowlist(self):
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": ""}, clear=False):
-            assert TelegramAdapter._is_callback_user_authorized("111") is False
+            with patch.object(TelegramAdapter, "_is_pairing_approved", return_value=False):
+                assert TelegramAdapter._is_callback_user_authorized("111") is False
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111,222"}, clear=False):
-            assert TelegramAdapter._is_callback_user_authorized("111") is True
-            assert TelegramAdapter._is_callback_user_authorized("999") is False
+            with patch.object(TelegramAdapter, "_is_pairing_approved", return_value=False):
+                assert TelegramAdapter._is_callback_user_authorized("111") is True
+                assert TelegramAdapter._is_callback_user_authorized("999") is False
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": ""}, clear=False):
+            with patch.object(TelegramAdapter, "_is_pairing_approved", return_value=True):
+                assert TelegramAdapter._is_callback_user_authorized("111") is True
 
 
 # ===========================================================================
@@ -329,8 +374,8 @@ class TestTelegramApprovalCallback:
         mock_resolve.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_update_prompt_callback_rejects_when_allowlist_empty(self, tmp_path):
-        """Update prompt buttons must not fail open when no callback-safe allowlist exists."""
+    async def test_update_prompt_callback_rejects_when_allowlist_and_pairing_are_absent(self, tmp_path):
+        """Update prompt buttons must not fail open when neither allowlist nor pairing authorizes them."""
         adapter = _make_adapter()
 
         query = AsyncMock()
@@ -349,13 +394,43 @@ class TestTelegramApprovalCallback:
         with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
             with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
                 with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": ""}, clear=False):
-                    await adapter._handle_callback_query(update, context)
+                    with patch.object(TelegramAdapter, "_is_pairing_approved", return_value=False):
+                        await adapter._handle_callback_query(update, context)
 
         mock_resolve.assert_not_called()
         query.answer.assert_called_once()
         assert "not authorized" in query.answer.call_args[1]["text"].lower()
         query.edit_message_text.assert_not_called()
         assert not (tmp_path / ".update_response").exists()
+
+    @pytest.mark.asyncio
+    async def test_update_prompt_callback_allows_paired_user_when_allowlist_is_empty(self, tmp_path):
+        """A paired Telegram DM user should still be able to click update prompt buttons."""
+        adapter = _make_adapter()
+
+        query = AsyncMock()
+        query.data = "update_prompt:y"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.from_user.id = 8685028645
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
+                with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": ""}, clear=False):
+                    with patch.object(TelegramAdapter, "_is_pairing_approved", return_value=True):
+                        await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_not_called()
+        query.answer.assert_called_once()
+        query.edit_message_text.assert_called_once()
+        assert (tmp_path / ".update_response").read_text() == "y"
 
     @pytest.mark.asyncio
     async def test_update_prompt_callback_rejects_unauthorized_user(self, tmp_path):
