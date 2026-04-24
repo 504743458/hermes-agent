@@ -12,9 +12,13 @@ class RestartTestAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
         self.sent: list[str] = []
+        self.prepared_for_shutdown = False
 
     async def connect(self):
         return True
+
+    def prepare_for_shutdown(self):
+        self.prepared_for_shutdown = True
 
     async def disconnect(self):
         return None

@@ -11,9 +11,11 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import tempfile
 import html as _html
 import re
+import time
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -247,17 +249,134 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
-        # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        # Interactive button callback state keyed by random nonces.
+        self._approval_state: Dict[str, Dict[str, Any]] = {}
+        self._update_prompt_state: Dict[str, Dict[str, Any]] = {}
+        self._accepting_interactive_callbacks = True
+
+    def prepare_for_shutdown(self) -> None:
+        """Reject approval/update callbacks while the gateway is draining."""
+        self._accepting_interactive_callbacks = False
+        self._approval_state.clear()
+        self._update_prompt_state.clear()
 
     @staticmethod
-    def _is_callback_user_authorized(user_id: str) -> bool:
-        """Return whether a Telegram inline-button caller may perform gated actions."""
+    def _callback_allowed_ids() -> set[str]:
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
         if not allowed_csv:
+            return set()
+        return {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+
+    @classmethod
+    def _is_pairing_approved(cls, user_id: str) -> bool:
+        if not user_id:
+            return False
+        try:
+            from gateway.pairing import PairingStore
+            return PairingStore().is_approved("telegram", str(user_id))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _session_is_dm(session_key: str) -> bool:
+        return ":dm:" in str(session_key or "")
+
+    @classmethod
+    def _dm_callback_user_id(cls, chat_id: str = "", session_key: str = "") -> str:
+        if cls._session_is_dm(session_key):
+            return str(chat_id or "")
+        return ""
+
+    @staticmethod
+    def _callback_nonce() -> str:
+        return secrets.token_urlsafe(12)
+
+    @staticmethod
+    def _callback_message_context(query: Any) -> tuple[str, str]:
+        message = getattr(query, "message", None)
+        if not message:
+            return "", ""
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "")
+        return chat_id, message_id
+
+    @staticmethod
+    def _callback_state_expired(state: Dict[str, Any]) -> bool:
+        try:
+            return float(state.get("expires_at", 0)) < time.time()
+        except (TypeError, ValueError):
             return True
-        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-        return "*" in allowed_ids or user_id in allowed_ids
+
+    def _prune_callback_states(self) -> None:
+        for store in (self._approval_state, self._update_prompt_state):
+            for nonce, state in list(store.items()):
+                if self._callback_state_expired(state):
+                    store.pop(nonce, None)
+
+    def _callback_state_matches_query(self, state: Dict[str, Any], query: Any) -> bool:
+        chat_id, message_id = self._callback_message_context(query)
+        if not chat_id or chat_id != str(state.get("chat_id", "")):
+            return False
+        if not message_id or message_id != str(state.get("message_id", "")):
+            return False
+        expected_user_id = str(state.get("expected_user_id", "") or "")
+        if expected_user_id:
+            caller_id = str(getattr(getattr(query, "from_user", None), "id", "") or "")
+            if caller_id != expected_user_id:
+                return False
+        return True
+
+    @staticmethod
+    def _current_update_context() -> Dict[str, Any]:
+        try:
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+        except Exception:
+            return {}
+
+        for name in (".update_pending.claimed.json", ".update_pending.json"):
+            path = home / name
+            try:
+                if path.exists():
+                    data = json.loads(path.read_text())
+                    return {
+                        "chat_id": str(data.get("chat_id") or ""),
+                        "session_key": str(data.get("session_key") or ""),
+                        "update_token": str(data.get("timestamp") or ""),
+                    }
+            except Exception:
+                continue
+        return {}
+
+    @classmethod
+    def _update_context_matches_state(cls, state: Dict[str, Any]) -> bool:
+        current = cls._current_update_context()
+        if not current:
+            return False
+        for key in ("chat_id", "session_key", "update_token"):
+            expected = str(state.get(key, "") or "")
+            observed = str(current.get(key, "") or "")
+            if expected and observed != expected:
+                return False
+        return True
+
+    @classmethod
+    def _callback_buttons_available(cls, chat_id: str = "", session_key: str = "") -> bool:
+        if cls._callback_allowed_ids():
+            return True
+        if cls._session_is_dm(session_key) and cls._is_pairing_approved(str(chat_id or "")):
+            return True
+        return False
+
+    @classmethod
+    def _is_callback_user_authorized(cls, user_id: str) -> bool:
+        """Return whether a Telegram inline-button caller may perform gated actions."""
+        allowed_ids = cls._callback_allowed_ids()
+        if not user_id:
+            return False
+        if allowed_ids:
+            return "*" in allowed_ids or user_id in allowed_ids
+        return cls._is_pairing_approved(user_id)
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -655,6 +774,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         
         try:
+            self._accepting_interactive_callbacks = True
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
@@ -886,6 +1006,7 @@ class TelegramAdapter(BasePlatformAdapter):
     
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        self.prepare_for_shutdown()
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -1190,13 +1311,17 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        if not self._callback_buttons_available(chat_id=chat_id, session_key=session_key):
+            return SendResult(success=False, error="callback auth unavailable")
         try:
+            self._prune_callback_states()
+            nonce = self._callback_nonce()
             default_hint = f" (default: {default})" if default else ""
             text = f"⚕ *Update needs your input:*\n\n{prompt}{default_hint}"
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✓ Yes", callback_data="update_prompt:y"),
-                    InlineKeyboardButton("✗ No", callback_data="update_prompt:n"),
+                    InlineKeyboardButton("✓ Yes", callback_data=f"up:y:{nonce}"),
+                    InlineKeyboardButton("✗ No", callback_data=f"up:n:{nonce}"),
                 ]
             ])
             msg = await self._bot.send_message(
@@ -1206,6 +1331,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_markup=keyboard,
                 **self._link_preview_kwargs(),
             )
+            update_context = self._current_update_context()
+            for existing_nonce, state in list(self._update_prompt_state.items()):
+                if (
+                    str(state.get("chat_id", "")) == str(chat_id)
+                    and str(state.get("session_key", "")) == str(session_key or "")
+                ):
+                    self._update_prompt_state.pop(existing_nonce, None)
+            self._update_prompt_state[nonce] = {
+                "chat_id": str(chat_id),
+                "session_key": str(session_key or update_context.get("session_key", "")),
+                "message_id": str(msg.message_id),
+                "expected_user_id": self._dm_callback_user_id(chat_id, session_key),
+                "update_token": str(update_context.get("update_token", "")),
+                "expires_at": time.time() + 1800,
+            }
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_update_prompt failed: %s", self.name, e)
@@ -1223,8 +1363,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        if not self._callback_buttons_available(chat_id=chat_id, session_key=session_key):
+            return SendResult(success=False, error="callback auth unavailable")
 
         try:
+            self._prune_callback_states()
+            nonce = self._callback_nonce()
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
             text = (
                 f"⚠️ <b>Command Approval Required</b>\n\n"
@@ -1235,22 +1379,14 @@ class TelegramAdapter(BasePlatformAdapter):
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
 
-            # We'll use the message_id as part of callback_data to look up session_key
-            # Send a placeholder first, then update — or use a counter.
-            # Simpler: use a monotonic counter to generate short IDs.
-            import itertools
-            if not hasattr(self, "_approval_counter"):
-                self._approval_counter = itertools.count(1)
-            approval_id = next(self._approval_counter)
-
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}"),
-                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}"),
+                    InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{nonce}"),
+                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{nonce}"),
                 ],
                 [
-                    InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}"),
-                    InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"),
+                    InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{nonce}"),
+                    InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{nonce}"),
                 ],
             ])
 
@@ -1267,8 +1403,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._bot.send_message(**kwargs)
 
-            # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            self._approval_state[nonce] = {
+                "session_key": session_key,
+                "chat_id": str(chat_id),
+                "message_id": str(msg.message_id),
+                "expected_user_id": self._dm_callback_user_id(chat_id, session_key),
+                "expires_at": time.time() + 300,
+            }
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1587,15 +1728,32 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_model_picker_callback(query, data, chat_id)
             return
 
-        # --- Exec approval callbacks (ea:choice:id) ---
+        if (
+            not self._accepting_interactive_callbacks
+            and data.startswith(("ea:", "up:", "update_prompt:"))
+        ):
+            await query.answer(text="Gateway is restarting; please send the request again after it comes back.")
+            return
+
+        # --- Exec approval callbacks (ea:choice:nonce) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
             if len(parts) == 3:
                 choice = parts[1]  # once, session, always, deny
-                try:
-                    approval_id = int(parts[2])
-                except (ValueError, IndexError):
+                nonce = parts[2]
+                if choice not in {"once", "session", "always", "deny"} or not nonce:
                     await query.answer(text="Invalid approval data.")
+                    return
+
+                self._prune_callback_states()
+                approval_state = self._approval_state.get(nonce)
+                if (
+                    not approval_state
+                    or self._callback_state_expired(approval_state)
+                    or not self._callback_state_matches_query(approval_state, query)
+                ):
+                    self._approval_state.pop(nonce, None)
+                    await query.answer(text="This approval has expired or is not valid for this message.")
                     return
 
                 # Only authorized users may click approval buttons.
@@ -1604,7 +1762,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
+                session_key = str(approval_state.get("session_key", ""))
+                self._approval_state.pop(nonce, None)
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
@@ -1644,13 +1803,33 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         # --- Update prompt callbacks ---
-        if not data.startswith("update_prompt:"):
+        if data.startswith("update_prompt:"):
+            await query.answer(text="This update prompt has expired.")
             return
-        answer = data.split(":", 1)[1]  # "y" or "n"
+        if not data.startswith("up:"):
+            return
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"y", "n"} or not parts[2]:
+            await query.answer(text="Invalid update prompt data.")
+            return
+        answer = parts[1]
+        nonce = parts[2]
+        self._prune_callback_states()
+        prompt_state = self._update_prompt_state.get(nonce)
+        if (
+            not prompt_state
+            or self._callback_state_expired(prompt_state)
+            or not self._callback_state_matches_query(prompt_state, query)
+            or not self._update_context_matches_state(prompt_state)
+        ):
+            self._update_prompt_state.pop(nonce, None)
+            await query.answer(text="This update prompt has expired or is not valid for this message.")
+            return
         caller_id = str(getattr(query.from_user, "id", ""))
         if not self._is_callback_user_authorized(caller_id):
             await query.answer(text="⛔ You are not authorized to answer update prompts.")
             return
+        self._update_prompt_state.pop(nonce, None)
         await query.answer(text=f"Sent '{answer}' to the update process.")
         # Edit the message to show the choice and remove buttons
         label = "Yes" if answer == "y" else "No"
