@@ -291,12 +291,22 @@ class TelegramAdapter(BasePlatformAdapter):
         self._slash_confirm_state: Dict[str, str] = {}
 
     @staticmethod
-    def _is_callback_user_authorized(user_id: str) -> bool:
-        """Return whether a Telegram inline-button caller may perform gated actions."""
+    def _callback_allowed_ids() -> set[str]:
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
         if not allowed_csv:
-            return True
-        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            return set()
+        return {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+
+    @classmethod
+    def _callback_buttons_available(cls) -> bool:
+        return bool(cls._callback_allowed_ids())
+
+    @classmethod
+    def _is_callback_user_authorized(cls, user_id: str) -> bool:
+        """Return whether a Telegram inline-button caller may perform gated actions."""
+        allowed_ids = cls._callback_allowed_ids()
+        if not allowed_ids or not user_id:
+            return False
         return "*" in allowed_ids or user_id in allowed_ids
 
     @classmethod
@@ -1329,6 +1339,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        if not self._callback_buttons_available():
+            return SendResult(success=False, error="callback auth unavailable")
         try:
             default_hint = f" (default: {default})" if default else ""
             text = f"⚕ *Update needs your input:*\n\n{prompt}{default_hint}"
@@ -1362,6 +1374,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        if not self._callback_buttons_available():
+            return SendResult(success=False, error="callback auth unavailable")
 
         try:
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
