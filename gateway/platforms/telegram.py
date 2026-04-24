@@ -306,53 +306,24 @@ class TelegramAdapter(BasePlatformAdapter):
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
 
-    def _is_callback_user_authorized(
-        self,
-        user_id: str,
-        *,
-        chat_id: Optional[str] = None,
-        chat_type: Optional[str] = None,
-        thread_id: Optional[str] = None,
-        user_name: Optional[str] = None,
-    ) -> bool:
-        """Return whether a Telegram inline-button caller may perform gated actions."""
-        normalized_user_id = str(user_id or "").strip()
-        if not normalized_user_id:
-            return False
-
-        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
-        auth_fn = getattr(runner, "_is_user_authorized", None)
-        if callable(auth_fn):
-            try:
-                from gateway.session import SessionSource
-
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
-
-                source = SessionSource(
-                    platform=Platform.TELEGRAM,
-                    chat_id=str(chat_id or normalized_user_id),
-                    chat_type=normalized_chat_type,
-                    user_id=normalized_user_id,
-                    user_name=str(user_name).strip() if user_name else None,
-                    thread_id=str(thread_id) if thread_id is not None else None,
-                )
-                return bool(auth_fn(source))
-            except Exception:
-                logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s",
-                    normalized_user_id,
-                    exc_info=True,
-                )
-
+    @staticmethod
+    def _callback_allowed_ids() -> set[str]:
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
         if not allowed_csv:
-            return True
-        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-        return "*" in allowed_ids or normalized_user_id in allowed_ids
+            return set()
+        return {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+
+    @classmethod
+    def _callback_buttons_available(cls) -> bool:
+        return bool(cls._callback_allowed_ids())
+
+    @classmethod
+    def _is_callback_user_authorized(cls, user_id: str) -> bool:
+        """Return whether a Telegram inline-button caller may perform gated actions."""
+        allowed_ids = cls._callback_allowed_ids()
+        if not allowed_ids or not user_id:
+            return False
+        return "*" in allowed_ids or user_id in allowed_ids
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1484,6 +1455,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        if not self._callback_buttons_available():
+            return SendResult(success=False, error="callback auth unavailable")
         try:
             default_hint = f" (default: {default})" if default else ""
             text = f"⚕ *Update needs your input:*\n\n{prompt}{default_hint}"
@@ -1520,6 +1493,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        if not self._callback_buttons_available():
+            return SendResult(success=False, error="callback auth unavailable")
 
         try:
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command

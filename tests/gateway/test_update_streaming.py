@@ -17,7 +17,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -372,6 +372,46 @@ class TestWatchUpdateProgress:
         assert mock_adapter.prompt_calls.call_args.kwargs["metadata"] == {
             "thread_id": "777"
         }
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_plain_text_when_button_prompt_send_returns_unsuccessful(self, tmp_path):
+        """Unsuccessful button sends must fall back to the plain text update prompt."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending = {"platform": "telegram", "chat_id": "111", "user_id": "222",
+                   "session_key": "agent:main:telegram:dm:111"}
+        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+        (hermes_home / ".update_output.txt").write_text("output\n")
+
+        mock_adapter = AsyncMock()
+        mock_adapter.send_update_prompt = AsyncMock(
+            return_value=SendResult(success=False, error="callback auth unavailable")
+        )
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        async def simulate_prompt_cycle():
+            await asyncio.sleep(0.3)
+            prompt = {"prompt": "Restore local changes? [Y/n]", "default": "y", "id": "test1"}
+            (hermes_home / ".update_prompt.json").write_text(json.dumps(prompt))
+            await asyncio.sleep(0.5)
+            (hermes_home / ".update_response").write_text("y")
+            (hermes_home / ".update_prompt.json").unlink(missing_ok=True)
+            await asyncio.sleep(0.3)
+            (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            task = asyncio.create_task(simulate_prompt_cycle())
+            await runner._watch_update_progress(
+                poll_interval=0.1,
+                stream_interval=0.2,
+                timeout=10.0,
+            )
+            await task
+
+        prompt_messages = [str(call) for call in mock_adapter.send.call_args_list]
+        assert any("Reply `/approve` (yes)" in item for item in prompt_messages)
 
     @pytest.mark.asyncio
     async def test_cleans_up_on_completion(self, tmp_path):
