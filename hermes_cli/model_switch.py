@@ -1186,6 +1186,13 @@ def list_authenticated_providers(
             # Merge with models.dev for preferred providers (same rationale as above).
             if hermes_slug in _MODELS_DEV_PREFERRED:
                 model_ids = _merge_with_models_dev(hermes_slug, model_ids)
+        if hermes_slug == "openai-codex":
+            try:
+                live_models = provider_model_ids(hermes_slug)
+                if live_models:
+                    model_ids = live_models
+            except Exception as exc:
+                logger.debug("OpenAI Codex live model listing failed: %s", exc)
         total = len(model_ids)
         top = model_ids[:max_models]
 
