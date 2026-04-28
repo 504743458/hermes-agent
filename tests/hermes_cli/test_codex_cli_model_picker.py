@@ -63,8 +63,13 @@ def hermes_auth_only_env(tmp_path, monkeypatch):
     return hermes_home
 
 
-def test_normal_path_still_works(hermes_auth_only_env):
+def test_normal_path_still_works(hermes_auth_only_env, monkeypatch):
     """openai-codex appears when tokens are already in Hermes auth store."""
+    monkeypatch.setattr(
+        "hermes_cli.models.provider_model_ids",
+        lambda provider: ["gpt-5.5", "gpt-5.4"] if provider == "openai-codex" else [],
+    )
+
     from hermes_cli.model_switch import list_authenticated_providers
 
     providers = list_authenticated_providers(
@@ -73,6 +78,8 @@ def test_normal_path_still_works(hermes_auth_only_env):
     )
     slugs = [p["slug"] for p in providers]
     assert "openai-codex" in slugs
+    codex = next(p for p in providers if p["slug"] == "openai-codex")
+    assert codex["models"] == ["gpt-5.5", "gpt-5.4"]
 
 
 @pytest.fixture()

@@ -1283,7 +1283,20 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized == "openai-codex":
         from hermes_cli.codex_models import get_codex_model_ids
 
-        return get_codex_model_ids()
+        access_token = ""
+        try:
+            from hermes_cli.auth import get_codex_auth_status, resolve_codex_runtime_credentials
+
+            status = get_codex_auth_status()
+            if status.get("logged_in"):
+                access_token = str(status.get("api_key") or "").strip()
+            if not access_token:
+                creds = resolve_codex_runtime_credentials()
+                access_token = str(creds.get("api_key") or "").strip()
+        except Exception:
+            access_token = ""
+
+        return get_codex_model_ids(access_token=access_token or None)
     if normalized in {"copilot", "copilot-acp"}:
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())

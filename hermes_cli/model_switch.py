@@ -809,7 +809,7 @@ def list_authenticated_providers(
         get_provider_info as _mdev_pinfo,
     )
     from hermes_cli.auth import PROVIDER_REGISTRY
-    from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS
+    from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS, provider_model_ids
 
     results: List[dict] = []
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
@@ -960,6 +960,13 @@ def list_authenticated_providers(
 
         # Use curated list — look up by Hermes slug, fall back to overlay key
         model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
+        if hermes_slug == "openai-codex":
+            try:
+                live_models = provider_model_ids(hermes_slug)
+                if live_models:
+                    model_ids = live_models
+            except Exception as exc:
+                logger.debug("OpenAI Codex live model listing failed: %s", exc)
         total = len(model_ids)
         top = model_ids[:max_models]
 

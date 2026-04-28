@@ -6,7 +6,7 @@ from hermes_cli.models import (
     OPENROUTER_MODELS, fetch_openrouter_models, model_ids, detect_provider_for_model,
     filter_nous_free_models, _NOUS_ALLOWED_FREE_MODELS,
     is_nous_free_tier, partition_nous_models_by_tier,
-    check_nous_free_tier, _FREE_TIER_CACHE_TTL,
+    check_nous_free_tier, _FREE_TIER_CACHE_TTL, provider_model_ids,
 )
 import hermes_cli.models as _models_mod
 
@@ -41,6 +41,28 @@ class TestModelIds:
         with patch("hermes_cli.models.fetch_openrouter_models", return_value=LIVE_OPENROUTER_MODELS):
             ids = model_ids()
         assert len(ids) == len(set(ids)), "Duplicate model IDs found"
+
+    def test_openai_codex_uses_hermes_auth_token_for_live_catalog(self, monkeypatch):
+        captured = {}
+
+        monkeypatch.setattr(
+            "hermes_cli.auth.get_codex_auth_status",
+            lambda: {"logged_in": True, "api_key": "codex-access-token"},
+        )
+
+        def _fake_get_codex_model_ids(access_token=None):
+            captured["access_token"] = access_token
+            return ["gpt-5.5", "gpt-5.4"]
+
+        monkeypatch.setattr(
+            "hermes_cli.codex_models.get_codex_model_ids",
+            _fake_get_codex_model_ids,
+        )
+
+        ids = provider_model_ids("openai-codex")
+
+        assert captured["access_token"] == "codex-access-token"
+        assert ids == ["gpt-5.5", "gpt-5.4"]
 
 
 
