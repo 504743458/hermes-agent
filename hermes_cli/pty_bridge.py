@@ -26,22 +26,32 @@ Design constraints:
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
 import select
 import signal
 import struct
 import sys
-import termios
 import time
 from typing import Optional, Sequence
 
 try:
+    import fcntl  # type: ignore
+    import termios  # type: ignore
+except ImportError:  # pragma: no cover - native Windows import path
+    fcntl = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
+
+try:
     import ptyprocess  # type: ignore
-    _PTY_AVAILABLE = not sys.platform.startswith("win")
 except ImportError:  # pragma: no cover - dev env without ptyprocess
     ptyprocess = None  # type: ignore
-    _PTY_AVAILABLE = False
+
+_PTY_AVAILABLE = (
+    ptyprocess is not None
+    and fcntl is not None
+    and termios is not None
+    and not sys.platform.startswith("win")
+)
 
 
 __all__ = ["PtyBridge", "PtyUnavailableError"]
@@ -183,6 +193,8 @@ class PtyBridge:
     def resize(self, cols: int, rows: int) -> None:
         """Forward a terminal resize to the child via ``TIOCSWINSZ``."""
         if self._closed:
+            return
+        if fcntl is None or termios is None:
             return
         # struct winsize: rows, cols, xpixel, ypixel (all unsigned short)
         winsize = struct.pack("HHHH", max(1, rows), max(1, cols), 0, 0)
