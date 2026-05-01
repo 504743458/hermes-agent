@@ -2182,11 +2182,35 @@ def _is_remote_session() -> bool:
 # =============================================================================
 
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
-    """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
-    
+    """Read Codex OAuth tokens from Hermes state.
+
+    Prefer a live credential-pool entry when one exists because dashboard
+    device-code login stores Codex OAuth state there. Fall back to the legacy
+    provider singleton in ``auth.json`` for older flows.
+
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
     Raises AuthError if no Codex tokens are stored.
     """
+    try:
+        from agent.credential_pool import load_pool
+
+        pool = load_pool("openai-codex")
+        if pool.has_credentials():
+            entry = pool.select()
+            if entry is not None:
+                access_token = str(entry.access_token or "").strip()
+                refresh_token = str(entry.refresh_token or "").strip()
+                if access_token and refresh_token:
+                    return {
+                        "tokens": {
+                            "access_token": access_token,
+                            "refresh_token": refresh_token,
+                        },
+                        "last_refresh": entry.last_refresh,
+                    }
+    except Exception:
+        pass
+
     if _lock:
         with _auth_store_lock():
             auth_store = _load_auth_store()

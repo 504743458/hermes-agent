@@ -75,6 +75,33 @@ def test_read_codex_tokens_missing(tmp_path, monkeypatch):
     assert exc.value.code == "codex_auth_missing"
 
 
+def test_resolve_codex_runtime_credentials_uses_pool_when_provider_state_missing(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    from agent.credential_pool import PooledCredential, load_pool
+
+    access_token = _jwt_with_exp(int(time.time()) + 3600)
+    pool = load_pool("openai-codex")
+    pool.add_entry(PooledCredential.from_dict("openai-codex", {
+        "access_token": access_token,
+        "refresh_token": "refresh-token",
+        "label": "dashboard device_code",
+        "auth_type": "oauth",
+        "source": "manual:dashboard_device_code",
+        "base_url": DEFAULT_CODEX_BASE_URL,
+    }))
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_key"] == access_token
+    assert resolved["base_url"] == DEFAULT_CODEX_BASE_URL
+    assert resolved["auth_mode"] == "chatgpt"
+
+
 def test_resolve_codex_runtime_credentials_missing_access_token(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _setup_hermes_auth(hermes_home, access_token="")
