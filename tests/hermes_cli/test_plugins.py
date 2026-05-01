@@ -161,6 +161,27 @@ class TestPluginDiscovery:
         }
         assert len(non_bundled) == 0
 
+    def test_manifest_parser_reads_plugin_yaml_as_utf8(self, tmp_path, monkeypatch):
+        """Bundled plugin manifests may contain UTF-8 punctuation on Windows."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = plugins_dir / "utf8_plugin"
+        plugin_dir.mkdir(parents=True)
+        manifest_path = plugin_dir / "plugin.yaml"
+        manifest_path.write_text(
+            "name: utf8_plugin\n"
+            "version: 0.1.0\n"
+            "description: \"UTF-8 punctuation — preserved\"\n",
+            encoding="utf-8",
+        )
+        (plugin_dir / "__init__.py").write_text("def register(ctx):\n    pass\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        manifest = mgr._parse_manifest(manifest_path, plugin_dir, "user", "")
+
+        assert manifest is not None
+        assert manifest.description == "UTF-8 punctuation — preserved"
+
     def test_entry_points_scanned(self, tmp_path, monkeypatch):
         """Entry-point based plugins are discovered (mocked)."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
