@@ -525,6 +525,35 @@ class TestTelegramApprovalCallback:
         assert adapter._approval_state == {}
 
     @pytest.mark.asyncio
+    async def test_slash_confirm_callback_rejects_after_shutdown_preparation(self):
+        adapter = _make_adapter()
+        adapter._slash_confirm_state["confirm-shutdown"] = "agent:main:telegram:dm:12345"
+        adapter.prepare_for_shutdown()
+
+        query = AsyncMock()
+        query.data = "sc:once:confirm-shutdown"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 42
+        query.from_user = MagicMock()
+        query.from_user.id = 111
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch("tools.slash_confirm.resolve", new_callable=AsyncMock) as mock_resolve:
+            await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_not_called()
+        query.answer.assert_called_once()
+        assert "restarting" in query.answer.call_args[1]["text"]
+        query.edit_message_text.assert_not_called()
+        assert adapter._slash_confirm_state == {}
+
+    @pytest.mark.asyncio
     async def test_model_picker_callback_not_affected(self):
         """Ensure model picker callbacks still route correctly."""
         adapter = _make_adapter()
