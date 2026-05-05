@@ -1440,6 +1440,7 @@ class TestStatusRemoteGateway:
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(ws, "get_running_pid", lambda: None)
+        monkeypatch.setattr(ws, "_probe_local_gateway_runtime", lambda: (False, None))
         monkeypatch.setattr(ws, "read_runtime_status", lambda: None)
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
         monkeypatch.setattr(ws, "_probe_gateway_health", lambda: (True, {
@@ -1485,6 +1486,7 @@ class TestStatusRemoteGateway:
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(ws, "get_running_pid", lambda: None)
+        monkeypatch.setattr(ws, "_probe_local_gateway_runtime", lambda: (False, None))
         monkeypatch.setattr(ws, "read_runtime_status", lambda: None)
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", None)
 
@@ -1499,6 +1501,7 @@ class TestStatusRemoteGateway:
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(ws, "get_running_pid", lambda: None)
+        monkeypatch.setattr(ws, "_probe_local_gateway_runtime", lambda: (False, None))
         monkeypatch.setattr(ws, "read_runtime_status", lambda: None)
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
         monkeypatch.setattr(ws, "_probe_gateway_health", lambda: (True, {
@@ -1511,6 +1514,73 @@ class TestStatusRemoteGateway:
         assert data["gateway_running"] is True
         assert data["gateway_pid"] is None
         assert data["gateway_state"] == "running"
+
+
+class TestStatusLocalGatewaySnapshot:
+    """Tests for /api/status with local service-manager liveness fallback."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+        self.client = TestClient(app)
+        self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    def test_status_falls_back_to_local_runtime_snapshot_when_pid_lock_missing(
+        self, monkeypatch
+    ):
+        """A managed gateway can be active even when the local PID/lock files are absent."""
+        import gateway.config as gateway_config
+        import hermes_cli.gateway as gateway_cli
+        import hermes_cli.web_server as ws
+
+        class _Platform:
+            value = "telegram"
+
+        class _GatewayConfig:
+            def get_connected_platforms(self):
+                return [_Platform()]
+
+        monkeypatch.setattr(ws, "get_running_pid", lambda: None)
+        monkeypatch.setattr(ws, "check_config_version", lambda: (1, 1))
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", None)
+        monkeypatch.setattr(
+            gateway_config, "load_gateway_config", lambda: _GatewayConfig()
+        )
+        monkeypatch.setattr(
+            ws,
+            "read_runtime_status",
+            lambda: {
+                "gateway_state": "running",
+                "platforms": {"telegram": {"state": "connected"}},
+                "pid": 287,
+                "updated_at": "2026-05-05T00:00:00+00:00",
+            },
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_gateway_runtime_snapshot",
+            lambda: gateway_cli.GatewayRuntimeSnapshot(
+                manager="systemd (user)",
+                service_installed=True,
+                service_running=True,
+                gateway_pids=(287,),
+                service_scope="user",
+            ),
+        )
+
+        resp = self.client.get("/api/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["gateway_running"] is True
+        assert data["gateway_pid"] == 287
+        assert data["gateway_state"] == "running"
+        assert data["gateway_platforms"] == {"telegram": {"state": "connected"}}
 
 
 # ---------------------------------------------------------------------------

@@ -520,17 +520,42 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
     return False, None
 
 
+def _probe_local_gateway_runtime() -> tuple[bool, int | None]:
+    """Return local service-manager/process liveness when PID/lock metadata is absent."""
+    try:
+        from hermes_cli.gateway import get_gateway_runtime_snapshot
+
+        snapshot = get_gateway_runtime_snapshot()
+    except Exception:
+        return False, None
+
+    if not getattr(snapshot, "running", False):
+        return False, None
+
+    for pid in getattr(snapshot, "gateway_pids", ()) or ():
+        if isinstance(pid, int) and pid > 0:
+            return True, pid
+    return True, None
+
+
 @app.get("/api/status")
 async def get_status():
     current_ver, latest_ver = check_config_version()
 
     # --- Gateway liveness detection ---
-    # Try local PID check first (same-host).  If that fails and a remote
-    # GATEWAY_HEALTH_URL is configured, probe the gateway over HTTP so the
-    # dashboard works when the gateway runs in a separate container.
+    # Try local PID check first (same-host).  Managed services can keep running
+    # even after PID/lock metadata goes missing, so fall back to the same local
+    # runtime snapshot used by the CLI before probing a configured remote
+    # GATEWAY_HEALTH_URL for cross-container deployments.
     gateway_pid = get_running_pid()
     gateway_running = gateway_pid is not None
+    gateway_liveness_source = "pid" if gateway_running else None
     remote_health_body: dict | None = None
+
+    if not gateway_running:
+        gateway_running, gateway_pid = _probe_local_gateway_runtime()
+        if gateway_running:
+            gateway_liveness_source = "local_runtime_snapshot"
 
     if not gateway_running and _GATEWAY_HEALTH_URL:
         loop = asyncio.get_event_loop()
@@ -539,6 +564,7 @@ async def get_status():
         )
         if alive:
             gateway_running = True
+            gateway_liveness_source = "remote_health"
             # PID from the remote container (display only — not locally valid)
             if remote_health_body:
                 gateway_pid = remote_health_body.get("pid")
@@ -576,18 +602,29 @@ async def get_status():
         gateway_exit_reason = runtime.get("exit_reason")
         gateway_updated_at = runtime.get("updated_at")
         if not gateway_running:
-            gateway_state = gateway_state if gateway_state in ("stopped", "startup_failed") else "stopped"
+            gateway_state = (
+                gateway_state
+                if gateway_state in ("stopped", "startup_failed")
+                else "stopped"
+            )
             gateway_platforms = {}
-        elif gateway_running and remote_health_body is not None:
-            # The health probe confirmed the gateway is alive, but the local
-            # runtime status file may be stale (cross-container).  Override
-            # stopped/None state so the dashboard shows the correct badge.
+        elif gateway_running and gateway_liveness_source in (
+            "local_runtime_snapshot",
+            "remote_health",
+        ):
+            # An independent liveness probe confirmed the gateway is alive, but
+            # the runtime status file may be stale.  Override stopped/None state
+            # so the dashboard shows the correct badge.
             if gateway_state in (None, "stopped"):
                 gateway_state = "running"
 
-    # If there was no runtime info at all but the health probe confirmed alive,
-    # ensure we still report the gateway as running (no shared volume scenario).
-    if gateway_running and gateway_state is None and remote_health_body is not None:
+    # If there was no runtime info at all but an independent liveness probe
+    # confirmed alive, ensure we still report the gateway as running.
+    if (
+        gateway_running
+        and gateway_state is None
+        and gateway_liveness_source in ("local_runtime_snapshot", "remote_health")
+    ):
         gateway_state = "running"
 
     active_sessions = 0
