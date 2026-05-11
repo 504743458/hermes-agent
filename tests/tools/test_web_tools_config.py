@@ -487,6 +487,7 @@ class TestWebSearchSchema:
 
         with patch("tools.web_tools._get_backend", return_value="parallel"), \
              patch("tools.web_tools._parallel_search", return_value={"success": True, "data": {"web": []}}) as mock_search, \
+             patch("tools.web_tools._browser_fallback_available", return_value=False), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.object(tools.web_tools._debug, "log_call"), \
              patch.object(tools.web_tools._debug, "save"):
@@ -507,6 +508,7 @@ class TestWebSearchErrorHandling:
 
         with patch("tools.web_tools._get_backend", return_value="firecrawl"), \
              patch("tools.web_tools._get_firecrawl_client", return_value=firecrawl_client), \
+             patch("tools.web_tools._browser_fallback_available", return_value=False), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.object(tools.web_tools._debug, "log_call") as mock_log_call, \
              patch.object(tools.web_tools._debug, "save"):

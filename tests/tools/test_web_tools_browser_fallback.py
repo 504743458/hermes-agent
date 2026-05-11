@@ -19,6 +19,7 @@ class TestBrowserBackedWebFallback:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "SEARXNG_URL",
     )
 
     def setup_method(self):
@@ -106,4 +107,77 @@ class TestBrowserBackedWebFallback:
         assert result["results"][0]["url"] == "https://example.com/page"
         assert result["results"][0]["title"] == "Example Page"
         assert result["results"][0]["content"] == "Extracted page body"
+        assert result["results"][0]["error"] is None
+
+    def test_web_extract_falls_back_to_browser_when_firecrawl_client_fails(self):
+        browser_extract = {
+            "success": True,
+            "result": {
+                "url": "https://example.com/page",
+                "title": "Example Page",
+                "content": "Recovered after Firecrawl init failed",
+            },
+        }
+
+        with (
+            patch("tools.web_tools._load_web_config", return_value={"backend": "firecrawl"}),
+            patch("tools.web_tools.check_firecrawl_api_key", return_value=True),
+            patch("tools.web_tools._get_firecrawl_client", side_effect=ValueError("missing firecrawl config")),
+            patch("tools.web_tools.check_auxiliary_model", return_value=False),
+            patch("tools.browser_tool.check_browser_requirements", return_value=True),
+            patch(
+                "tools.web_tools._run_agent_browser_json",
+                side_effect=[
+                    {"success": True, "data": {"url": "https://example.com/page", "title": "Example Page"}},
+                    {"success": True, "data": browser_extract},
+                    {"success": True, "data": {"closed": True}},
+                ],
+            ),
+        ):
+            from tools.web_tools import web_extract_tool
+
+            result = json.loads(
+                asyncio.get_event_loop().run_until_complete(
+                    web_extract_tool(["https://example.com/page"], use_llm_processing=False)
+                )
+            )
+
+        assert result["results"][0]["url"] == "https://example.com/page"
+        assert result["results"][0]["content"] == "Recovered after Firecrawl init failed"
+        assert result["results"][0]["error"] is None
+
+    def test_web_extract_falls_back_to_browser_when_searxng_is_search_backend(self):
+        browser_extract = {
+            "success": True,
+            "result": {
+                "url": "https://example.com/page",
+                "title": "Example Page",
+                "content": "Extracted through browser fallback",
+            },
+        }
+
+        with (
+            patch("tools.web_tools._load_web_config", return_value={"backend": "searxng"}),
+            patch.dict(os.environ, {"SEARXNG_URL": "http://127.0.0.1:8888"}, clear=False),
+            patch("tools.web_tools.check_auxiliary_model", return_value=False),
+            patch("tools.browser_tool.check_browser_requirements", return_value=True),
+            patch(
+                "tools.web_tools._run_agent_browser_json",
+                side_effect=[
+                    {"success": True, "data": {"url": "https://example.com/page", "title": "Example Page"}},
+                    {"success": True, "data": browser_extract},
+                    {"success": True, "data": {"closed": True}},
+                ],
+            ),
+        ):
+            from tools.web_tools import web_extract_tool
+
+            result = json.loads(
+                asyncio.get_event_loop().run_until_complete(
+                    web_extract_tool(["https://example.com/page"], use_llm_processing=False)
+                )
+            )
+
+        assert result["results"][0]["url"] == "https://example.com/page"
+        assert result["results"][0]["content"] == "Extracted through browser fallback"
         assert result["results"][0]["error"] is None

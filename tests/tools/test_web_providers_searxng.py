@@ -326,6 +326,7 @@ class TestSearXNGOnlyExtractCrawlErrors:
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "searxng"})
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
         monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
+        monkeypatch.setattr(web_tools, "_browser_fallback_available", lambda: False)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
 
         import json
