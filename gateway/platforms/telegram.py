@@ -425,15 +425,55 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         return False
 
-    @classmethod
-    def _is_callback_user_authorized(cls, user_id: str) -> bool:
+    def _is_callback_user_authorized(
+        self_or_user_id,
+        user_id: Optional[str] = None,
+        *,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+    ) -> bool:
         """Return whether a Telegram inline-button caller may perform gated actions."""
-        allowed_ids = cls._callback_allowed_ids()
-        if not user_id:
+        adapter = self_or_user_id if isinstance(self_or_user_id, TelegramAdapter) else None
+        cls = type(adapter) if adapter is not None else TelegramAdapter
+        normalized_user_id = str(user_id if user_id is not None else self_or_user_id or "").strip()
+        if not normalized_user_id:
             return False
+
+        if adapter is not None:
+            runner = getattr(getattr(adapter, "_message_handler", None), "__self__", None)
+            auth_fn = getattr(runner, "_is_user_authorized", None)
+            if callable(auth_fn):
+                try:
+                    from gateway.session import SessionSource
+
+                    normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+                    if normalized_chat_type == "private":
+                        normalized_chat_type = "dm"
+                    elif normalized_chat_type == "supergroup":
+                        normalized_chat_type = "forum" if thread_id is not None else "group"
+
+                    source = SessionSource(
+                        platform=Platform.TELEGRAM,
+                        chat_id=str(chat_id or normalized_user_id),
+                        chat_type=normalized_chat_type,
+                        user_id=normalized_user_id,
+                        user_name=str(user_name).strip() if user_name else None,
+                        thread_id=str(thread_id) if thread_id is not None else None,
+                    )
+                    return bool(auth_fn(source))
+                except Exception:
+                    logger.debug(
+                        "[Telegram] Falling back to env/pairing callback auth for user %s",
+                        normalized_user_id,
+                        exc_info=True,
+                    )
+
+        allowed_ids = cls._callback_allowed_ids()
         if allowed_ids:
-            return "*" in allowed_ids or user_id in allowed_ids
-        return cls._is_pairing_approved(user_id)
+            return "*" in allowed_ids or normalized_user_id in allowed_ids
+        return cls._is_pairing_approved(normalized_user_id)
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:

@@ -380,14 +380,15 @@ class TestTelegramApprovalCallback:
     @pytest.mark.asyncio
     async def test_approval_callback_rejects_user_blocked_by_global_allowlist(self):
         adapter = _make_adapter()
-        adapter._approval_state[7] = "agent:main:telegram:group:12345:99"
+        adapter._approval_state["nonce-global"] = _approval_state()
         runner = _AuthRunner(authorized=False)
         adapter._message_handler = runner._handle_message
 
         query = AsyncMock()
-        query.data = "ea:once:7"
+        query.data = "ea:once:nonce-global"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.message.chat.type = "private"
         query.from_user = MagicMock()
         query.from_user.id = 222
@@ -406,7 +407,7 @@ class TestTelegramApprovalCallback:
         query.answer.assert_called_once()
         assert "not authorized" in query.answer.call_args[1]["text"].lower()
         query.edit_message_text.assert_not_called()
-        assert adapter._approval_state[7] == "agent:main:telegram:group:12345:99"
+        assert "nonce-global" in adapter._approval_state
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
@@ -735,13 +736,16 @@ class TestTelegramApprovalCallback:
     @pytest.mark.asyncio
     async def test_update_prompt_callback_rejects_user_blocked_by_global_allowlist(self, tmp_path):
         adapter = _make_adapter()
+        adapter._update_prompt_state["prompt-blocked"] = _update_prompt_state()
+        _write_update_pending(tmp_path)
         runner = _AuthRunner(authorized=False)
         adapter._message_handler = runner._handle_message
 
         query = AsyncMock()
-        query.data = "update_prompt:y"
+        query.data = "up:y:prompt-blocked"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 77
         query.message.chat.type = "private"
         query.from_user = MagicMock()
         query.from_user.id = 222
